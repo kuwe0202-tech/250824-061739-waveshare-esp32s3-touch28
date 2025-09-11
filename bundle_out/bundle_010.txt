@@ -1,0 +1,513 @@
+﻿KANON: Projekt-Hinweise klimakontroller
+Version: 2025-09-11.2211
+Gueltig ab: 2025-09-11
+Status: Diese Version ist allein gueltig. Fruehere Versionen sind ungueltig.
+Scope: Alle Projekt-Chats "klimakontroller".
+
+Abschnitt A - Erinnerung 1: Arbeitsregeln (extrem wichtig, strikt einzuhalten)
+[Erinnere dich an die erinnerung "Arbeitsregeln"]
+Abschnitt B - Erinnerung 2: Projektziel und Funktionsumfang
+[Erinnere dich an die erinnerung "Ziele klimakontroller"]
+Abschnitt C - Erinnerung 3: Rahmenbedinungen
+[Erinnere dich an die erinnerung "Rahmenbedingungen"]
+
+
+
+/* === BEGIN FILE: src\LVGX.ino.cpp === */
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <string.h>
+#include <vector>
+#include <algorithm>
+#include <ctype.h>
+#include "runtime_globals.h" 
+#include "Log.h"
+#include "PlatformConfig.h"
+#include "Touch_CST328.h"
+#include "LVGL_Treiber.h"
+#include "ui.h"
+#include "Display_ST7789_Treiber.h"
+#include "Task_Ticker.h"
+#include "RTC_PCF85063.h"
+#include "screens.h"
+#include "actions.h"
+#include "SD_Karten_Treiber.h"
+#include "ui_sd_manager.h"
+#include "Konfiguration.h"
+#include "boot_header.h"
+#include "fs_policy.h"
+#include "fs_paths.h"
+
+#include <inttypes.h>
+
+#include "runtime_tasks.h"
+#include <SD_MMC.h>
+
+std::atomic<bool> g_boot_phase_active{true};
+static bool g_is_in_safe_mode = false; 
+
+#ifdef LVGL_VERSION_MAJOR
+#if !(LVGL_VERSION_MAJOR == 8 && LVGL_VERSION_MINOR == 3)
+#warning "LVGL ist nicht 8.3.x â€“ dein Projekt zielt auf 8.3.4."
+#endif
+#endif
+
+
+static bool handle_panic_dump_recovery(void);
+static void handle_fs_migration(void);
+static void persist_panic_dump_to_sd(const PanicHdr& hdr, const uint8_t* tail_data);
+static void fs_boot_hook(const char* reason);
+
+extern RTC_NOINIT_ATTR PanicHdr g_panic_hdr;
+extern RTC_NOINIT_ATTR uint8_t g_panic_tail_buffer[CFG_PANIC_TAIL_MAX];
+
+static bool s_fs_boot_actions_done = false;
+
+
+void ui_boot_screen_update_progress(int percent, const char* status_text);
+
+void update_boot_ui(int percent, const char* text) {
+    ui_boot_screen_update_progress(percent, text);
+    lv_timer_handler();
+    watchdog_safe_delay(1);
+}
+
+
+void setup() {
+    g_boot_phase_active = true;
+    Serial.begin(115200);
+
+    if (!boot_header_init()) {
+        Serial.println("\n\nFATAL: Boot header initialization failed! Halting.\n\n");
+        while (true) { delay(1000); }
+    }
+    
+    log_init();
+
+    const boot_header_t* bh = boot_header_get();
+    if (bh) { LOGI_T("BOOT", "EVENT_BOOT{seq=%" PRIu64 ",reason=%s}", bh->boot_seq, bh->reset_reason_txt); }
+
+    watchdog_init();
+    config_init();
+
+    
+    
+    
+    g_is_in_safe_mode = handle_panic_dump_recovery();
+
+    
+   if (g_is_in_safe_mode || CFG_BOOT_FSM == 0) {
+    if (!g_is_in_safe_mode) {
+        LOGI_T("BOOT", "Manual override: Forcing SAFE MODE via CFG_BOOT_FSM=0.");
+    }
+    g_is_in_safe_mode = true; 
+
+        
+        tft_init();
+        backlight_init();
+        Lvgl_Init();
+        ui_init();
+        
+        
+        lv_obj_t* label = lv_label_create(lv_scr_act());
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(label, "Systemfehler!\nGerat startet im abgesicherten Modus.");
+        lv_obj_center(label);
+
+        
+        rtc_pcf85063_init();
+        touch_init();
+        runtime_tasks_init(); 
+
+        
+        g_boot_phase_active = false;
+        return;
+    }
+
+    
+    
+    
+    tft_init();
+    backlight_init();
+    Lvgl_Init();
+    ui_init(); 
+    update_boot_ui(5, "System-Core bereit...");
+
+    rtc_pcf85063_init();
+    rtc_set_valid_callback(log_notify_rtc_valid);
+    update_boot_ui(15, "Warte auf RTC...");
+    uint32_t rtc_wait_start = millis();
+    while(!rtc_is_valid() && millis() - rtc_wait_start < 5000) {
+        RTC_PCF85063_Loop();
+        watchdog_safe_delay(10);
+    }
+    
+    if (rtc_is_valid()) {
+        update_boot_ui(20, "RTC bereit.");
+        rtc_sync_system_time_from_hw();
+    } else {
+        LOGW_T("BOOT", "RTC nach 5s immer noch ungÃ¼ltig.");
+        update_boot_ui(20, "RTC ungÃ¼ltig!");
+    }
+
+    touch_init();
+    update_boot_ui(25, "Touch bereit...");
+
+    bool sd_available = false;
+    update_boot_ui(30, "PrÃ¼fe SD-Karte...");
+    SD_MMC.setPins(platform.pin_sd_clk, platform.pin_sd_cmd, platform.pin_sd_d0);
+    if (!SD_MMC.begin("/sdcard", true, false)) {
+        if (SD_MMC.cardType() == CARD_NONE) {
+            LOGW_T("BOOT", "Keine SD-Karte gefunden. Fahre ohne SD-Logging fort.");
+            update_boot_ui(40, "Keine SD-Karte.");
+            sd_available = false;
+        } else {
+            LOGE_T("BOOT", "SD-Karte fehlerhaft.");
+            update_boot_ui(100, "Fehler: SD-Karte!");
+            while(1) { watchdog_feed(); }
+        }
+    } else {
+        fs_policy_init(SD_MMC);
+        update_boot_ui(40, "SD-Karte bereit.");
+        sd_available = true;
+    }
+
+    fs_flush_hook_register(fs_boot_hook);
+    sd_worker_init();
+
+    if (sd_available) {
+        if (!log_boot_preallocate()) {
+            update_boot_ui(100, "Fehler: Log-Datei!");
+            while(1) { watchdog_feed(); }
+        }
+        log_boot_adopt_preallocated_file();
+    }
+    update_boot_ui(95, "Log-System bereit.");
+
+    update_boot_ui(100, "Start...");
+    delay(200);
+
+    loadScreen(SCREEN_ID_PAGE_DESKTOP);
+    RTC_PCF85063_SetupUhr(objects.text_uhrzeit);
+    RTC_PCF85063_SetupDatum(objects.text_datum);
+    RTC_PCF85063_SetupWochentag(objects.text_wochentag);
+    runtime_tasks_init();
+    laufzeitlog_init();
+
+    g_boot_phase_active = false;
+    LOGI_T("BOOT", "Setup abgeschlossen.");
+}
+
+
+void loop() {
+    
+    if (g_is_in_safe_mode) {
+        
+        task_ticker_loop(); 
+        Lvgl_Loop();
+        ui_tick();
+        watchdog_feed();
+        delay(10); 
+        return;
+    }
+    
+    
+    if (touch_need_reinit()) {
+        LOGW("main: Re-initializing touch controller...");
+        stop_touch_poll_task();
+        touch_init();
+        if (touchInitialized) {
+            touch_clear_reinit();
+            touch_block_until = millis() + 1000;
+        }
+        start_touch_poll_task(Config::TOUCH_POLL_MS);
+    }
+    task_ticker_loop();
+    
+    Lvgl_Loop();
+    ui_tick();
+    watchdog_feed();
+}
+
+
+
+
+static bool handle_panic_dump_recovery(void) {
+    if (g_panic_hdr.magic != PANIC_HDR_MAGIC || g_panic_hdr.ver != PANIC_HDR_VER) {
+        nvs_ab_write_u64("reboot_cnt", 0);
+        return false;
+    }
+    uint64_t reboot_count = 0;
+    nvs_ab_read_u64("reboot_cnt", &reboot_count);
+    reboot_count++;
+    nvs_ab_write_u64("reboot_cnt", reboot_count);
+    LOGW_T("BOOT", "Valid panic dump found. Reboot count: %llu", reboot_count);
+    if (reboot_count > CFG_PANIC_SAFE_MODE_THRESHOLD) {
+        char detail[32];
+        snprintf(detail, sizeof(detail), "{reboot_cnt:%llu}", reboot_count);
+        telemetry_event("entered_safe_mode", detail);
+        return true;
+    }
+    return false;
+}
+
+static void handle_fs_migration(void) {
+    uint64_t migration_done_flag = 0;
+    nvs_ab_read_u64("migration_done", &migration_done_flag);
+    if (migration_done_flag == 1) return;
+
+    LOGI_T("BOOT", "Performing one-time FS path migration...");
+    bool success = true;
+    if (!sd_global_io_lock(2000)) { LOGW_T("BOOT","FS migration: no IO lock"); success=false; }
+    else {
+      success &= fs_policy_rename_dir(FsFinalPath::Legacy::LOGS,   FsFinalPath::LOGS);
+      success &= fs_policy_rename_dir(FsFinalPath::Legacy::DUMP,   FsFinalPath::DUMP);
+      success &= fs_policy_rename_dir(FsFinalPath::Legacy::CONFIG, FsFinalPath::CONFIG);
+      sd_global_io_unlock();
+    }
+    if (success) {
+        LOGI_T("BOOT", "FS migration successful.");
+        nvs_ab_write_u64("migration_done", 1);
+    } else {
+        LOGE_T("BOOT", "FS migration failed!");
+    }
+}
+
+static bool is_pnc_dump_name_(const char* name, uint32_t* out_num) {
+    if (!name) return false;
+    const char* base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    if (strncmp(base, "PNC", 3) != 0) return false;
+    const char* p = base + 3;
+    for (int i = 0; i < 5; ++i) {
+        if (!isdigit((unsigned char)p[i])) return false;
+    }
+    if (strncmp(p + 5, ".DMP", 4) != 0 || p[9] != '\0') return false;
+    if (out_num) {
+        uint32_t v = 0;
+        for (int i = 0; i < 5; ++i) v = v * 10 + (uint32_t)(p[i] - '0');
+        *out_num = v;
+    }
+    return true;
+}
+
+static void rotate_panic_dumps_if_needed_(uint32_t keep_max) {
+    if (keep_max == 0) {
+        File dir = fs_open_final(FsFinalPath::DUMP, "r");
+        if (!dir) return;
+        for (;;) {
+            File f = dir.openNextFile();
+            if (!f) break;
+            if (!f.isDirectory()) {
+                char nm[64];
+                const char* nptr = f.name();
+                if (nptr) {
+                    strncpy(nm, nptr, sizeof(nm) - 1);
+                    nm[sizeof(nm) - 1] = '\0';
+                    uint32_t num = 0;
+                    if (is_pnc_dump_name_(nm, &num)) {
+                        char full[64];
+                        snprintf(full, sizeof(full), "%s/%s", FsFinalPath::DUMP, nm);
+                        fs_policy_remove(full);
+                    }
+                }
+            }
+            f.close();
+        }
+        dir.close();
+        return;
+    }
+
+    std::vector<uint32_t> nums;
+    nums.reserve(16);
+
+    File dir = fs_open_final(FsFinalPath::DUMP, "r");
+    if (!dir) return;
+    for (;;) {
+        File f = dir.openNextFile();
+        if (!f) break;
+        if (!f.isDirectory()) {
+            char nm[64];
+            const char* nptr = f.name();
+            if (nptr) {
+                strncpy(nm, nptr, sizeof(nm) - 1);
+                nm[sizeof(nm) - 1] = '\0';
+                uint32_t num = 0;
+                if (is_pnc_dump_name_(nm, &num)) {
+                    nums.push_back(num);
+                }
+            }
+        }
+        f.close();
+    }
+    dir.close();
+
+    if (nums.size() <= keep_max) return;
+    std::sort(nums.begin(), nums.end());
+    const size_t to_del = nums.size() - keep_max;
+    for (size_t i = 0; i < to_del; ++i) {
+        char full[64];
+        snprintf(full, sizeof(full), "%s/PNC%05u.DMP", FsFinalPath::DUMP, (unsigned)nums[i]);
+        fs_policy_remove(full);
+    }
+}
+
+static void persist_panic_dump_to_sd(const PanicHdr& hdr, const uint8_t* tail_data) {
+    LOGI_T("BOOT", "Persisting panic dump to SD card...");
+    char filename[32];
+    snprintf(filename, sizeof(filename), "%s/PNC%05u.DMP", FsFinalPath::DUMP, (unsigned)(boot_header_get()->boot_seq % 100000));
+    char tmp_filename[36];
+    snprintf(tmp_filename, sizeof(tmp_filename), "%s.tmp", filename);
+
+    if (!sd_global_io_lock(5000)) { telemetry_event("panic_dump_persist_fail","{code:nolock}"); return; }
+    LfnTempScope scope;
+    File f = fs_open_temp(scope, tmp_filename, "w");
+    if (!f) {
+        LOGE_T("BOOT", "Failed to create panic dump file.");
+        telemetry_event("panic_dump_persist_fail", "{code:open}");
+        sd_global_io_unlock(); return;
+    }
+
+    size_t written_hdr = f.write((const uint8_t*)&hdr, sizeof(hdr));
+    size_t written_tail = f.write(tail_data, hdr.len);
+    fs_fsync(f);
+    f.close();
+
+    if (written_hdr != sizeof(hdr) || written_tail != hdr.len) {
+        LOGE_T("BOOT", "Failed to write complete panic dump.");
+        telemetry_event("panic_dump_persist_fail", "{code:write}");
+        fs_policy_remove(tmp_filename);
+        sd_global_io_unlock(); return;
+    }
+
+    if (fs_policy_rename(scope, tmp_filename, filename)) {
+        LOGI_T("BOOT", "Panic dump persisted to %s", filename);
+        char detail[32];
+        snprintf(detail, sizeof(detail), "{bytes:%u}", (unsigned)(sizeof(hdr) + hdr.len));
+        telemetry_event("panic_dump_persist_ok", detail);
+        rotate_panic_dumps_if_needed_(CFG_DUMP_ROTATE_MAX);
+    } else {
+        LOGE_T("BOOT", "Failed to rename panic dump file.");
+        telemetry_event("panic_dump_persist_fail", "{code:rename}");
+    }
+    sd_global_io_unlock();
+}
+
+static void fs_boot_hook(const char* reason) {
+    if (!reason) return;
+
+    if (strcmp(reason, FS_REASON_SD_MOUNTED) == 0) {
+        telemetry_event("sd_mounted", "{ok:1}");
+        if (!s_fs_boot_actions_done) {
+            handle_fs_migration();
+            if (g_panic_hdr.magic == PANIC_HDR_MAGIC) {
+                persist_panic_dump_to_sd(g_panic_hdr, g_panic_tail_buffer);
+                g_panic_hdr.magic = 0;
+            }
+            s_fs_boot_actions_done = true;
+        }
+        
+    } else if (strcmp(reason, FS_REASON_SD_UNMOUNT) == 0) {
+        telemetry_event("sd_mounted", "{ok:0}");
+    }
+}
+
+
+/* === END FILE: src\LVGX.ino.cpp === */
+/* === BEGIN FILE: src\nvs_ab_fallback.cpp === */
+
+#include <Arduino.h>
+extern "C" {
+  #include <nvs.h>
+  #include <nvs_flash.h>
+}
+
+extern "C" bool __attribute__((weak))
+nvs_ab_read_u64(const char* key, uint64_t* out) {
+  if (!key) return false;
+
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    err = nvs_flash_init();
+  }
+  if (err != ESP_OK) { if (out) *out = 0; return false; }
+
+  nvs_handle_t h;
+  
+  err = nvs_open("sys", NVS_READONLY, &h);
+  if (err != ESP_OK) { if (out) *out = 0; return false; }
+
+  uint64_t v = 0;
+  err = nvs_get_u64(h, key, &v);
+  nvs_close(h);
+
+  if (err == ESP_OK) { if (out) *out = v; return true; }
+  if (out) *out = 0;
+  return false;
+}
+
+extern "C" bool __attribute__((weak))
+nvs_ab_write_u64(const char* key, uint64_t v) {
+  if (!key) return false;
+
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    err = nvs_flash_init();
+  }
+  if (err != ESP_OK) return false;
+
+  nvs_handle_t h;
+  
+  err = nvs_open("sys", NVS_READWRITE, &h);
+  if (err != ESP_OK) return false;
+
+  err = nvs_set_u64(h, key, v);
+  if (err == ESP_OK) err = nvs_commit(h);
+  nvs_close(h);
+  return (err == ESP_OK);
+}
+
+
+/* === END FILE: src\nvs_ab_fallback.cpp === */
+/* === BEGIN FILE: src\PlatformConfig.cpp === */
+#include "PlatformConfig.h"
+#if defined(ARDUINO_ARCH_ESP32)
+  #include <driver/spi_common.h>
+#else
+  
+  typedef int spi_host_device_t;
+  enum { SPI1_HOST = 0, SPI2_HOST = 1, SPI3_HOST = 2 };
+#endif
+
+
+PlatformConfig platform = {
+    
+    DisplayDriver::ST7789, 320, 240, 1,
+    40, 45, -1, 42, 41, 39, 5,
+    SPI3_HOST, 80000000, 16000000,
+
+    
+    TouchDriver::CST328, true, false, true,
+    0, 240, 0, 320,
+    1, 1, 3, 4, 2, 0x1A,
+
+
+SdMode::SDMMC, BusWidth::BW1, 20000000,
+14, 17, 16, -1, -1, 21, -1,
+-1, -1, -1, -1, -1,
+
+    
+    0, 11, 10, 0x51,
+
+    
+    true, 2500, 5000
+};
+
+PlatformConfig probe_platform() {
+    return platform;
+}
+/* === END FILE: src\PlatformConfig.cpp === */

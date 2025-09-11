@@ -1,0 +1,15 @@
+{
+    "bundle":  "bundle_012.txt",
+    "total_code_len":  19486,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\runtime_tasks.cpp",
+                      "code_len":  15010
+                  },
+                  {
+                      "rel":  "src\\screens.cpp [part 1/3]",
+                      "code_len":  4960
+                  }
+              ]
+}

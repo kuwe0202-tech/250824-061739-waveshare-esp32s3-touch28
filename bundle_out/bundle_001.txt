@@ -1,0 +1,811 @@
+﻿KANON: Projekt-Hinweise klimakontroller
+Version: 2025-09-11.2211
+Gueltig ab: 2025-09-11
+Status: Diese Version ist allein gueltig. Fruehere Versionen sind ungueltig.
+Scope: Alle Projekt-Chats "klimakontroller".
+
+Abschnitt A - Erinnerung 1: Arbeitsregeln (extrem wichtig, strikt einzuhalten)
+[Erinnere dich an die erinnerung "Arbeitsregeln"]
+Abschnitt B - Erinnerung 2: Projektziel und Funktionsumfang
+[Erinnere dich an die erinnerung "Ziele klimakontroller"]
+Abschnitt C - Erinnerung 3: Rahmenbedinungen
+[Erinnere dich an die erinnerung "Rahmenbedingungen"]
+
+
+
+/* === BEGIN FILE: include\actions.h === */
+
+#ifndef EEZ_LVGL_UI_EVENTS_H
+#define EEZ_LVGL_UI_EVENTS_H
+
+#include <lvgl.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern void action_rtc_setze_datum_und_uhrzeit_aus_eez_roller(lv_event_t * e);
+extern void action_export_current_log_to_txt(lv_event_t * e);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+/* === END FILE: include\actions.h === */
+/* === BEGIN FILE: include\boot_header.h === */
+
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define BOOT_HDR_USE_MBEDTLS 0
+
+#define BOOT_HEADER_SCHEMA_VERSION 1U
+#define BOOT_HEADER_SECURITY_VERSION 1U
+
+#define BOOT_UUID_SIZE 16
+#define FW_HASH_SIZE 32
+#define RESET_REASON_TXT_SIZE 32
+
+struct boot_header_t {
+    uint8_t  boot_uuid[BOOT_UUID_SIZE];
+    uint8_t  fw_hash[FW_HASH_SIZE];
+    uint32_t schema_version;
+    uint32_t security_version;
+    char     reset_reason_txt[RESET_REASON_TXT_SIZE];
+    uint64_t boot_seq;
+} __attribute__((packed, aligned(8)));
+
+#define EXPECTED_BOOT_HEADER_SIZE (BOOT_UUID_SIZE + FW_HASH_SIZE + sizeof(uint32_t)*2 + RESET_REASON_TXT_SIZE + sizeof(uint64_t))
+static_assert(sizeof(boot_header_t) == EXPECTED_BOOT_HEADER_SIZE, "Boot header ABI mismatch!");
+static_assert(alignof(boot_header_t) == 8, "Boot header must be 8-byte aligned.");
+
+
+
+
+
+#define PANIC_HDR_MAGIC 0x50444D50u 
+#define PANIC_HDR_VER 1             
+#define PANIC_FW_HASH_SHORT_SIZE 9  
+
+
+enum {
+    PANIC_FL_UART_DUMPED    = 1u << 0, 
+    PANIC_FL_RETRY_PENDING  = 1u << 1  
+};
+
+struct PanicHdr {
+  uint32_t magic;       
+  uint16_t ver;         
+  uint16_t flags;       
+  uint32_t len;         
+  uint32_t crc;         
+  uint64_t ts_us;       
+  uint32_t last_seq;    
+  uint32_t reboot_cnt;  
+  char     fw_hash[PANIC_FW_HASH_SHORT_SIZE]; 
+  
+} __attribute__((packed, aligned(4)));
+
+
+static_assert(sizeof(PanicHdr) % 4 == 0, "PanicHdr must be 4-byte aligned in size");
+static_assert(PANIC_FW_HASH_SHORT_SIZE >= 2, "PanicHdr::fw_hash must have space for at least one character and a null terminator");
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+bool                 boot_header_init(void);
+const boot_header_t* boot_header_get(void);
+void                 boot_header_uart_dump(void);
+
+uint64_t             ts_boot_us(void);
+
+uint64_t             ts_boot_us_iram(void);
+
+
+
+bool nvs_ab_read_u64 (const char* key, uint64_t* out);
+bool nvs_ab_write_u64(const char* key, uint64_t  value);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+/* === END FILE: include\boot_header.h === */
+/* === BEGIN FILE: include\Display_ST7789_Treiber.h === */
+#pragma once
+#include <LovyanGFX.hpp>
+#include "Konfiguration.h"
+
+class LGFX : public lgfx::LGFX_Device {
+public:
+  LGFX();
+
+private:
+  lgfx::Bus_SPI       _bus_instance;
+  lgfx::Panel_ST7789  _panel_instance;
+};
+
+extern LGFX tft;
+bool tft_is_ready();
+void tft_init();
+void backlight_init();
+void set_backlight_percent(uint8_t pct);
+void display_sleep();
+void display_wake();
+/* === END FILE: include\Display_ST7789_Treiber.h === */
+/* === BEGIN FILE: include\fonts.h === */
+#ifndef EEZ_LVGL_UI_FONTS_H
+#define EEZ_LVGL_UI_FONTS_H
+
+#include <lvgl.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+/* === END FILE: include\fonts.h === */
+/* === BEGIN FILE: include\fs_paths.h === */
+
+
+#pragma once
+#include <iterator>
+
+namespace FsFinalPath {
+    
+    
+    constexpr const char* LOGS    = "/log";
+    constexpr const char* DUMP    = "/dump";
+    constexpr const char* CONFIG  = "/sys"; 
+    constexpr const char* UPDATE  = "/upd"; 
+    constexpr const char* SERVICE = "/serv";
+
+    
+    namespace Legacy {
+        constexpr const char* LOGS   = "/LOGS";
+        constexpr const char* DUMP   = "/DUMP";
+        constexpr const char* CONFIG = "/CFG";
+    }
+
+    
+    
+    
+    
+
+    
+    
+    constexpr const char* CONFIG_FILE = "/sys/CFG.BIN";
+    constexpr const char* ANCHOR_FILE = "/sys/ANCH.BIN";
+
+    
+    
+    constexpr const char* LOG_FILE_0 = "/log/SYS.000";
+    constexpr const char* LOG_FILE_1 = "/log/SYS.001";
+    constexpr const char* LOG_FILE_2 = "/log/SYS.002";
+    constexpr const char* LOG_FILE_3 = "/log/SYS.003";
+    constexpr const char* LOG_FILE_4 = "/log/SYS.004";
+
+    constexpr const char* LOG_IDX_0 = "/log/SYS0.IDX";
+    constexpr const char* LOG_IDX_1 = "/log/SYS1.IDX";
+
+    inline constexpr const char* LOG_FILES[] = {
+        LOG_FILE_0, LOG_FILE_1, LOG_FILE_2, LOG_FILE_3, LOG_FILE_4
+    };
+    inline constexpr const char* LOG_IDXS[]  = {
+        LOG_IDX_0,  LOG_IDX_1
+    };
+
+    static_assert(std::size(LOG_FILES) > 0, "FsFinalPath::LOG_FILES must not be empty");
+    static_assert(std::size(LOG_IDXS) == 2, "FsFinalPath::LOG_IDXS must have exactly 2 entries");
+}
+
+
+namespace FsSpecial {
+    constexpr const char* DIRBAR_BASENAME = ".DIRBAR"; 
+}
+
+
+/* === END FILE: include\fs_paths.h === */
+/* === BEGIN FILE: include\fs_policy.h === */
+
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+#include <mutex>
+#include <vector>
+#include <string>
+
+#include <FS.h>
+
+enum class FsPolicyError : uint8_t {
+    OK = 0,
+    ERR_PATH_NOT_8DOT3_FINAL,
+    ERR_RENAME_CROSS_DIR,
+    ERR_FATFS_API_ERROR,
+    ERR_COMMIT_VERIFY_FAIL
+};
+
+struct FsPolicyTelemetry {
+    uint32_t policy_violations_total = 0;
+    FsPolicyError last_error = FsPolicyError::OK;
+    char     last_error_path[260] = {0};
+
+    uint32_t lfn_temp_in_use = 0;
+    uint32_t lfn_temp_leaks_total = 0;
+
+    uint32_t commit_rename_used = 0;
+    uint32_t commit_copy_used   = 0;
+};
+
+class LfnTempScope {
+public:
+    LfnTempScope();
+    ~LfnTempScope();
+
+    void register_path(const char* p);
+    void unregister_path(const char* p);
+
+private:
+    std::mutex mtx;
+    std::vector<std::string> paths;
+};
+
+void fs_policy_init(FS& fs);
+
+File fs_open_final(const char* path, const char* mode);
+File fs_open_temp(LfnTempScope& scope, const char* path, const char* mode);
+
+bool fs_policy_mkdir(const char* dir_path);
+bool fs_policy_remove(const char* path);
+
+bool fs_policy_rename(LfnTempScope& scope, const char* from_temp_path, const char* to_final_path);
+
+bool fs_policy_rename_dir(const char* from_path, const char* to_path);
+
+FsPolicyError fs_policy_commit_copy(LfnTempScope& scope, const char* src_temp_path, const char* dst_final_path);
+
+void fs_fsync(File& file);
+
+bool fs_policy_is_final_path(const char* path);
+bool fs_same_dir(const char* path_a, const char* path_b);
+
+void fs_policy_get_telemetry(FsPolicyTelemetry& stats);
+
+
+/* === END FILE: include\fs_policy.h === */
+/* === BEGIN FILE: include\images.h === */
+#ifndef EEZ_LVGL_UI_IMAGES_H
+#define EEZ_LVGL_UI_IMAGES_H
+
+#include <lvgl.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef EXT_IMG_DESC_T
+#define EXT_IMG_DESC_T
+typedef struct _ext_img_desc_t {
+    const char *name;
+    const lv_img_dsc_t *img_dsc;
+} ext_img_desc_t;
+#endif
+
+extern const ext_img_desc_t images[1];
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+/* === END FILE: include\images.h === */
+/* === BEGIN FILE: include\Konfiguration.h === */
+
+
+#ifndef KONFIGURATION_H
+#define KONFIGURATION_H
+
+#include <stdint.h>
+#include <Arduino.h>
+
+#if defined(ARDUINO_ARCH_ESP32)
+  #include <driver/ledc.h>
+#endif
+
+#include "PlatformConfig.h"
+#include "fs_policy.h"
+
+extern uint16_t Flash_Size;
+
+void config_init();
+void laufzeitlog_init();
+
+
+#ifndef CFG_LOG_PREALLOC_MB
+#define CFG_LOG_PREALLOC_MB           64u
+#endif
+#ifndef CFG_LOG_PREALLOC_BYTES
+#define CFG_LOG_PREALLOC_BYTES        (CFG_LOG_PREALLOC_MB * 1024u * 1024u)
+#endif
+#ifndef CFG_LOG_PREALLOC_CHUNK_BYTES
+#define CFG_LOG_PREALLOC_CHUNK_BYTES  (512u * 1024u) 
+#endif
+#ifndef CFG_LOG_PREALLOC_SLICE_BUDGET_MS
+#define CFG_LOG_PREALLOC_SLICE_BUDGET_MS 40 
+#endif
+
+
+#ifndef CFG_LOG_RING_BYTES
+#define CFG_LOG_RING_BYTES            (32u * 1024u)   
+#endif
+#ifndef CFG_LOG_FLUSH_MS_BASE
+#define CFG_LOG_FLUSH_MS_BASE         5000u           
+#endif
+#ifndef CFG_LOG_FLUSH_MS_BURST
+#define CFG_LOG_FLUSH_MS_BURST        500u            
+#endif
+#ifndef CFG_LOG_FLUSH_MAX_GAP_MS
+#define CFG_LOG_FLUSH_MAX_GAP_MS      (60u * 1000u)   
+#endif
+#ifndef CFG_LOG_ROTATE_BYTES
+#define CFG_LOG_ROTATE_BYTES          (256u * 1024u)  
+#endif
+#ifndef CFG_LOG_ROTATE_24H
+#define CFG_LOG_ROTATE_24H            1               
+#endif
+
+
+#ifndef CFG_LOG_UART_FALLBACK
+#define CFG_LOG_UART_FALLBACK         1               
+#endif
+#ifndef CFG_LOG_UART_MAX_LPS
+#define CFG_LOG_UART_MAX_LPS          10u             
+#endif
+#ifndef CFG_LOG_UART_BOOT_BURST
+#define CFG_LOG_UART_BOOT_BURST       100u            
+#endif
+
+
+#ifndef CFG_FS_SPEED_CAP_HZ
+#define CFG_FS_SPEED_CAP_HZ           20000000u       
+#endif
+#ifndef CFG_FS_GUARD_ERR_WIN
+#define CFG_FS_GUARD_ERR_WIN          30000u          
+#endif
+#ifndef CFG_FS_READONLY_THRESHOLD
+#define CFG_FS_READONLY_THRESHOLD     3u              
+#endif
+
+
+#ifndef CFG_DUMP_ROTATE_MAX
+#define CFG_DUMP_ROTATE_MAX           8u              
+#endif
+#ifndef CFG_PANIC_SAFE_MODE_THRESHOLD
+#define CFG_PANIC_SAFE_MODE_THRESHOLD 2u              
+#endif
+#ifndef CFG_PANIC_TAIL_MAX
+#define CFG_PANIC_TAIL_MAX            (4u * 1024u)    
+#endif
+
+
+#ifndef CFG_CLOCK_JUMP_THRESHOLD_S
+#define CFG_CLOCK_JUMP_THRESHOLD_S    5               
+#endif
+
+
+#ifndef TELEMETRY_SD_STALE_MS
+#define TELEMETRY_SD_STALE_MS         5000u           
+#endif
+
+
+
+#ifndef CFG_BOOT_FSM
+#define CFG_BOOT_FSM 1
+#endif
+#ifndef CFG_BOOT_PROGRESS_SMOOTH_MIN_STEP_PCT
+#define CFG_BOOT_PROGRESS_SMOOTH_MIN_STEP_PCT 1 
+#endif
+#ifndef CFG_BOOT_PROGRESS_SMOOTH_RATE_MAX_PCT_PER_S
+#define CFG_BOOT_PROGRESS_SMOOTH_RATE_MAX_PCT_PER_S 7 
+#endif
+#ifndef CFG_FS_MIN_FREE_MB
+#define CFG_FS_MIN_FREE_MB 128 
+#endif
+
+
+
+#define DISPLAY_WIDTH           (platform.display_width)
+#define DISPLAY_HEIGHT          (platform.display_height)
+
+namespace Config {
+
+#if defined(ARDUINO_ARCH_ESP32)
+constexpr ledc_mode_t    BL_PWM_MODE     = LEDC_LOW_SPEED_MODE;
+constexpr ledc_timer_t   BL_PWM_TIMER    = LEDC_TIMER_0;
+constexpr ledc_channel_t BL_PWM_CHANNEL  = LEDC_CHANNEL_0;
+constexpr uint32_t       BL_PWM_FREQ_HZ  = 5000;
+constexpr uint8_t        BL_PWM_RES_BITS = 8;
+#endif
+constexpr uint8_t  DISP_BACKLIGHT_MAX      = 255;
+constexpr uint8_t  DISP_BACKLIGHT_INIT_PCT = 100;
+
+constexpr uint16_t LVGL_TICK_MS           = 5;
+constexpr bool     LVGL_FULL_REFRESH      = false;
+constexpr uint16_t LVGL_TOUCH_GUARD_MS    = 60;
+constexpr uint16_t LVGL_TOUCH_HOLDOVER_MS = 40;
+constexpr uint8_t  LVGL_BUF_FRAC_NUM      = 1;
+constexpr uint8_t  LVGL_BUF_FRAC_DEN      = 2;
+
+constexpr bool     UI_DEBUG_OVERLAY      = true;
+constexpr uint16_t UI_DEBUG_UPDATE_MS    = 500;   
+constexpr uint32_t UI_DEBUG_COLOR_HEX    = 0x0000FF;
+constexpr uint8_t  UI_DEBUG_TEXT_OPA     = 200;
+constexpr int8_t   UI_DEBUG_OFFSET_X     = -4;
+constexpr int8_t   UI_DEBUG_OFFSET_Y     = 18;
+constexpr bool     UI_DEBUG_TRY_BIG_FONT = true;
+
+constexpr int      RTC_YEAR_OFFSET    = 1970;
+constexpr int      RTC_MIN_YEAR       = 2020;
+constexpr int      RTC_UI_MIN_YEAR    = 2020;
+constexpr int      RTC_UI_MAX_YEAR    = 2050;
+constexpr uint16_t RTC_INIT_TICK_MS   = 10;
+constexpr uint16_t RTC_ADVANCE_WAIT_MS= 1200;
+constexpr uint16_t RTC_KICK_PAUSE_MS  = 5;
+constexpr uint8_t  RTC_MAX_RETRIES    = 5;
+constexpr uint16_t RTC_RETRY_GAP_MS   = 100;
+constexpr bool     RTC_USE_CAP_SEL    = true;
+
+constexpr uint16_t I2C_TIMEOUT_MS = 10;
+constexpr uint16_t TOUCH_POLL_MS  = 10;   
+
+#ifndef CONFIG_TEL_KEYS
+#define CONFIG_TEL_KEYS
+constexpr bool     TEL_ENABLE          = true;
+constexpr uint16_t TEL_SAMPLE_MS       = 250;
+constexpr uint32_t TEL_LOG_INTERVAL_MS = 60*60*1000UL;
+constexpr uint32_t TEL_FIRST_DELAY_MS  = 3000;
+constexpr uint16_t TEL_MIN_WARM_SAMPLES= 8;
+#endif
+
+} 
+
+#endif
+
+
+/* === END FILE: include\Konfiguration.h === */
+/* === BEGIN FILE: include\Log.h === */
+
+
+#ifndef LOG_H
+#define LOG_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stddef.h>
+#include "Konfiguration.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+typedef enum {
+    LOG_LVL_ERR = 1,
+    LOG_LVL_WRN = 2,
+    LOG_LVL_INF = 3,
+    LOG_LVL_DBG = 4,
+} log_level_t;
+
+
+typedef struct {
+    char        filename[96];    
+    uint32_t    last_write_ms;   
+    log_level_t last_level;      
+    bool        valid;           
+} last_log_info_t;
+
+
+typedef bool (*RtcProvider)(char* buf, size_t buflen);
+typedef void (*log_progress_callback_t)(uint32_t current, uint32_t total);
+
+
+void    log_init(void);
+void    log_set_rtc_provider(RtcProvider provider);
+void    log_write(uint8_t level, const char* tag, const char* msg);
+void    log_flush(const char* reason);
+void    log_force_flush(void);              
+void    log_rotate_maybe(void);             
+bool    log_readback_tail(char* dst, size_t dst_len, size_t* out_len);
+void    log_sd_status_changed(bool mounted_ok);
+
+void    log_notify_rtc_valid(void);
+
+bool    log_is_prealloc_complete(void);
+
+bool log_prealloc_prepare(void);
+bool log_primer(void);
+
+
+
+bool log_boot_preallocate(void);
+void log_boot_adopt_preallocated_file(void);
+void log_register_progress_callback(log_progress_callback_t cb);
+
+
+
+void    log_get_last_log_info(last_log_info_t* info);
+bool    log_run_export_for_file(const char* bin_log_path, bool export_txt, bool export_jsonl);
+void    log_pause_flush(void);
+void    log_resume_flush(void);
+void        nt_display_woke(void);
+void log_hint_system_busy(uint32_t ms);
+
+
+#ifndef LOG_FMT_TMP_BYTES
+#define LOG_FMT_TMP_BYTES 256  
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define LOG_PRINTF_LIKE(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx)))
+#else
+  #define LOG_PRINTF_LIKE(fmt_idx, va_idx)
+#endif
+
+static inline void log__writef(uint8_t lvl, const char* tag, const char* fmt, ...) LOG_PRINTF_LIKE(3,4);
+static inline void log__writef(uint8_t lvl, const char* tag, const char* fmt, ...) {
+    char buf[LOG_FMT_TMP_BYTES];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    buf[sizeof(buf)-1] = '\0';
+    log_write(lvl, tag, buf);
+}
+
+
+#define LOGE_T(TAG, FMT, ...) log__writef(LOG_LVL_ERR, (TAG), (FMT), ##__VA_ARGS__)
+#define LOGW_T(TAG, FMT, ...) log__writef(LOG_LVL_WRN, (TAG), (FMT), ##__VA_ARGS__)
+#define LOGI_T(TAG, FMT, ...) log__writef(LOG_LVL_INF, (TAG), (FMT), ##__VA_ARGS__)
+#define LOGD_T(TAG, FMT, ...) log__writef(LOG_LVL_DBG, (TAG), (FMT), ##__VA_ARGS__)
+
+
+#define LOGE(FMT, ...) LOGE_T(__func__, (FMT), ##__VA_ARGS__)
+#define LOGW(FMT, ...) LOGW_T(__func__, (FMT), ##__VA_ARGS__)
+#define LOGI(FMT, ...) LOGI_T(__func__, (FMT), ##__VA_ARGS__)
+#define LOGD(FMT, ...) LOGD_T(__func__, (FMT), ##__VA_ARGS__)
+
+
+#define LOGE_RAW(TAG, MSG) log_write(LOG_LVL_ERR, (TAG), (MSG))
+#define LOGW_RAW(TAG, MSG) log_write(LOG_LVL_WRN, (TAG), (MSG))
+#define LOGI_RAW(TAG, MSG) log_write(LOG_LVL_INF, (TAG), (MSG))
+#define LOGD_RAW(TAG, MSG) log_write(LOG_LVL_DBG, (TAG), (MSG))
+
+
+#define LOG_INIT_BEGIN(name) LOGI_T("init", "%s: init...", (name))
+#define LOG_INIT_READY(name) LOGI_T("init", "%s: bereit.", (name))
+#define LOG_INIT_FAIL(name, FMT, ...) LOGW_T("init", "%s: init fehlgeschlagen: " FMT, (name), ##__VA_ARGS__)
+
+
+#define LOG_FLUSH(reason) do { log_flush((reason)); } while (0)
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+/* === END FILE: include\Log.h === */
+/* === BEGIN FILE: include\lvgl_mem_custom.h === */
+#ifndef LVGL_MEM_CUSTOM_H
+#define LVGL_MEM_CUSTOM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#ifndef LVGL_ALLOC_TRACK_SLOTS
+#  define LVGL_ALLOC_TRACK_SLOTS 8192
+#endif
+
+typedef struct { void* p; size_t sz; } lvgl_trk_ent_t;
+static lvgl_trk_ent_t _trk[LVGL_ALLOC_TRACK_SLOTS];
+static size_t _trk_used_bytes = 0;
+static size_t _trk_peak_bytes = 0;
+static size_t _trk_blocks     = 0;
+static size_t _trk_max_block  = 0;
+
+static inline uint32_t _hptr(const void* p){
+  uintptr_t x = (uintptr_t)p; x >>= 3;
+  return (uint32_t)(x & (LVGL_ALLOC_TRACK_SLOTS-1));
+}
+static inline int _trk_find_slot(const void* p){
+  uint32_t i = _hptr(p);
+  for (uint32_t k=0;k<LVGL_ALLOC_TRACK_SLOTS;k++){
+    uint32_t j = (i+k) & (LVGL_ALLOC_TRACK_SLOTS-1);
+    if (_trk[j].p == p)   return (int)j;
+    if (_trk[j].p == NULL) return -1;
+  }
+  return -1;
+}
+static inline int _trk_find_free(void){
+  for (uint32_t j=0;j<LVGL_ALLOC_TRACK_SLOTS;j++)
+    if (_trk[j].p == NULL) return (int)j;
+  return -1;
+}
+static inline void _trk_recompute_max(void){
+  size_t m=0;
+  for (uint32_t j=0;j<LVGL_ALLOC_TRACK_SLOTS;j++)
+    if (_trk[j].p && _trk[j].sz>m) m=_trk[j].sz;
+  _trk_max_block=m;
+}
+
+
+#if __has_include(<esp_heap_caps.h>)
+  #include <esp_heap_caps.h>
+  #define LVGL_SYS_ALLOC(n)      heap_caps_malloc((n), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)
+  #define LVGL_SYS_REALLOC(p,n)  heap_caps_realloc((p),(n), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)
+  #define LVGL_SYS_FREE(p)       heap_caps_free((p))
+#else
+  #include <stdlib.h>
+  #define LVGL_SYS_ALLOC(n)      malloc((n))
+  #define LVGL_SYS_REALLOC(p,n)  realloc((p),(n))
+  #define LVGL_SYS_FREE(p)       free((p))
+#endif
+
+
+void* lvgl_mem_alloc(size_t n){
+  if (!n) return NULL;
+  void* p = LVGL_SYS_ALLOC(n);
+  if (!p) return NULL;
+  int slot = _trk_find_free();
+  if (slot>=0){
+    _trk[slot].p = p;
+    _trk[slot].sz= n;
+    _trk_blocks++;
+    _trk_used_bytes += n;
+    if (_trk_used_bytes > _trk_peak_bytes) _trk_peak_bytes = _trk_used_bytes;
+    if (n > _trk_max_block) _trk_max_block = n;
+  }
+  return p;
+}
+
+void  lvgl_mem_free(void* p){
+  if (!p) return;
+  int slot = _trk_find_slot(p);
+  if (slot>=0){
+    size_t n = _trk[slot].sz;
+    _trk[slot].p = NULL; _trk[slot].sz = 0;
+    if (_trk_used_bytes >= n) _trk_used_bytes -= n; else _trk_used_bytes=0;
+    if (_trk_blocks>0) _trk_blocks--;
+    if (n == _trk_max_block) _trk_recompute_max();
+  }
+  LVGL_SYS_FREE(p);
+}
+
+void* lvgl_mem_realloc(void* p, size_t n){
+  if (!p) return lvgl_mem_alloc(n);
+  if (n==0){ lvgl_mem_free(p); return NULL; }
+
+  size_t old=0;
+  int slot = _trk_find_slot(p);
+  if (slot>=0) old = _trk[slot].sz;
+
+  void* np = LVGL_SYS_REALLOC(p,n);
+  if (!np) return NULL;
+
+  if (slot>=0){
+    _trk[slot].p = np;
+    _trk[slot].sz= n;
+  }else{
+    int s2=_trk_find_free();
+    if (s2>=0){ _trk[s2].p=np; _trk[s2].sz=n; _trk_blocks++; }
+  }
+  if (_trk_used_bytes >= old) _trk_used_bytes -= old; else _trk_used_bytes=0;
+  _trk_used_bytes += n;
+  if (_trk_used_bytes > _trk_peak_bytes) _trk_peak_bytes = _trk_used_bytes;
+  if (n > _trk_max_block) _trk_max_block = n;
+  return np;
+}
+
+
+size_t lvgl_mem_stat_used(void)      { return _trk_used_bytes; }
+size_t lvgl_mem_stat_peak(void)      { return _trk_peak_bytes; }
+size_t lvgl_mem_stat_blocks(void)    { return _trk_blocks; }
+size_t lvgl_mem_stat_max_alloc(void) { return _trk_max_block; }
+
+#ifdef __cplusplus
+}
+#endif
+#endif 
+
+
+/* === END FILE: include\lvgl_mem_custom.h === */
+/* === BEGIN FILE: include\LVGL_Treiber.h === */
+
+#ifndef LVGL_TREIBER_H
+#define LVGL_TREIBER_H
+
+#include "PlatformConfig.h"
+#include "Konfiguration.h"
+#include <lvgl.h>
+#include <cstdint>
+
+#define LVGL_UPDATE_TICK_MS Config::LVGL_TICK_MS
+
+
+
+lv_obj_t* ui_create_modal_overlay(lv_obj_t* parent);
+
+
+void Lvgl_print(const char * buf);
+void Lvgl_Display_LCD(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p);
+void Lvgl_Touchpad_Read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data);
+void Lvgl_TickHandler(void *arg);
+void Lvgl_Init(void);
+void Lvgl_Loop(void);
+
+uint16_t Lvgl_GetFPS();
+uint8_t  Lvgl_GetLoopCpuPct();
+
+struct LvglRenderStats {
+  uint32_t samples;        
+  uint32_t ms_avg;         
+  uint32_t ms_max;         
+  uint32_t px_avg;         
+  uint16_t fill_pct_avg;   
+  uint32_t full_flush_cnt; 
+};
+
+void Lvgl_GetRenderStats(LvglRenderStats* out);
+void Lvgl_ResetRenderStats();
+
+struct LvglMemStats {
+  size_t used;
+  size_t peak;
+  size_t blocks;
+  size_t max_alloc;
+  uint8_t frag_est_pct; 
+};
+
+
+#if LV_MEM_CUSTOM
+extern "C" size_t lvgl_mem_stat_used();
+extern "C" size_t lvgl_mem_stat_peak();
+extern "C" size_t lvgl_mem_stat_blocks();
+extern "C" size_t lvgl_mem_stat_max_alloc();
+#endif
+
+inline bool Lvgl_MemGetStats(LvglMemStats* out) {
+#if LV_MEM_CUSTOM
+  if (!out) return false;
+  out->used      = lvgl_mem_stat_used();
+  out->peak      = lvgl_mem_stat_peak();
+  out->blocks    = lvgl_mem_stat_blocks();
+  out->max_alloc = lvgl_mem_stat_max_alloc();
+  out->frag_est_pct = (out->used > 0 && out->max_alloc < out->used)
+                      ? (uint8_t)((100u * (out->used - out->max_alloc)) / out->used)
+                      : 0u;
+  return true;
+#else
+  (void)out; return false;
+#endif
+}
+
+#endif
+
+/* === END FILE: include\LVGL_Treiber.h === */

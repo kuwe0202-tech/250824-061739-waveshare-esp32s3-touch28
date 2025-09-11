@@ -1,0 +1,282 @@
+/* === BEGIN FILE: src/LVGL_Treiber.cpp (FINALE KORRIGIERTE VERSION) === */
+#include "LVGL_Treiber.h"
+
+#if LV_COLOR_DEPTH != 16
+  #error "This driver requires LV_COLOR_DEPTH to be 16 for DMA compatibility."
+#endif
+
+#include "Display_ST7789_Treiber.h"
+#include "Touch_CST328.h"
+#include <esp_timer.h>
+#include <esp_heap_caps.h>
+#include "Log.h"
+#include "runtime_tasks.h"
+#include "Konfiguration.h"
+#include "PlatformConfig.h"
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t *buf1 = nullptr;
+static lv_color_t *buf2 = nullptr;
+
+void Lvgl_print(const char* buf) {
+#ifdef ENABLE_SERIAL_CONSOLE
+  if (buf) { Serial.printf("%s", buf); Serial.flush(); }
+#else
+  // KORRIGIERT: Alte Log-API durch neues Makro ersetzt
+  if (buf) LOGD("[LVGL] %s", buf);
+#endif
+}
+
+static volatile uint32_t s_fps = 0;
+static uint32_t s_frame_count = 0;
+static uint32_t s_fps_last_ms = 0;
+
+static uint8_t  s_loop_cpu_pct = 0;
+static uint64_t s_loop_busy_us_acc = 0;
+static uint64_t s_loop_window_start_us = 0;
+
+static lv_obj_t  *s_dbg_label = nullptr;
+static lv_timer_t*s_dbg_timer = nullptr;
+
+static uint64_t s_rs_ms_sum = 0;
+static uint32_t s_rs_ms_max = 0;
+static uint64_t s_rs_px_sum = 0;
+static uint32_t s_rs_samples = 0;
+static uint64_t s_rs_fill_pct_sum = 0;
+static uint32_t s_rs_full_flush_cnt = 0;
+
+static void Lvgl_Monitor(lv_disp_drv_t *disp_drv, uint32_t time, uint32_t px) {
+  (void)disp_drv;
+  
+  s_rs_samples++;
+  s_rs_ms_sum += time;
+  if (time > s_rs_ms_max) s_rs_ms_max = time;
+
+  s_rs_px_sum += px;
+  const uint32_t full_px = (uint32_t)platform.display_width * (uint32_t)platform.display_height;
+  const uint32_t fill_pct = full_px ? (uint32_t)((px * 100ULL) / full_px) : 0;
+  s_rs_fill_pct_sum += fill_pct;
+  if (px >= full_px) s_rs_full_flush_cnt++;
+  
+  s_frame_count++;
+  uint32_t now = millis();
+  if (s_fps_last_ms == 0) s_fps_last_ms = now;
+  uint32_t elapsed = now - s_fps_last_ms;
+  if (elapsed >= 1000u) {
+    s_fps = (s_frame_count * 1000u) / (elapsed ? elapsed : 1u);
+    s_frame_count = 0;
+    s_fps_last_ms = now;
+  }
+  tel_render_on_flush(time, px, px >= full_px);
+
+}
+
+uint16_t Lvgl_GetFPS() { return static_cast<uint16_t>(s_fps); }
+uint8_t  Lvgl_GetLoopCpuPct() { return s_loop_cpu_pct; }
+
+static void dbg_timer_cb(lv_timer_t * t) {
+  (void)t;
+  if (!s_dbg_label) return;
+  size_t ram = heap_caps_get_free_size(MALLOC_CAP_8BIT)
+             + heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  lv_label_set_text_fmt(s_dbg_label, "FPS:%u Hz  CPU:%u%%  RAM:%lu kB",
+                        (unsigned)Lvgl_GetFPS(),
+                        (unsigned)Lvgl_GetLoopCpuPct(),
+                        (unsigned long)(ram / 1024u));
+}
+
+void Lvgl_Display_LCD(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+  int32_t w = platform.display_width;
+  int32_t h = platform.display_height;
+  int32_t x1 = area->x1, y1 = area->y1, x2 = area->x2, y2 = area->y2;
+
+  if (x2 < 0 || y2 < 0 || x1 >= w || y1 >= h) {
+    lv_disp_flush_ready(disp_drv);
+    return;
+  }
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 >= w) x2 = w - 1;
+  if (y2 >= h) y2 = h - 1;
+
+  const bool full_w = (x1 <= 0) && (x2 >= (w  - 1));
+  const bool full_h = (y1 <= 0) && (y2 >= (h - 1));
+  if (full_w && full_h) {
+    touch_block_until = millis() + Config::LVGL_TOUCH_GUARD_MS;
+  }
+
+  tft.pushImage(
+    x1, y1,
+    (x2 - x1 + 1), (y2 - y1 + 1),
+    (uint16_t *)color_p);
+
+  lv_disp_flush_ready(disp_drv);
+}
+
+
+
+static uint16_t s_last_x = 0, s_last_y = 0;
+static bool     s_last_pressed = false;
+static unsigned long s_last_ts = 0;
+
+void Lvgl_Touchpad_Read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
+  (void)indev_drv;
+
+  const unsigned long now = millis();
+
+ if (now < touch_block_until) {
+    data->state = LV_INDEV_STATE_REL;
+    s_last_pressed = false;
+    return;
+}
+
+  uint16_t touchpad_x[5] = { 0 };
+  uint16_t touchpad_y[5] = { 0 };
+  uint16_t strength[5]   = { 0 };
+  uint8_t  touchpad_cnt  = 0;
+
+  const uint8_t pressed = Touch_Get_XY(
+    touchpad_x, touchpad_y, strength, &touchpad_cnt, CST328_LCD_TOUCH_MAX_POINTS);
+
+  if (pressed && touchpad_cnt > 0) {
+    uint16_t dispX, dispY;
+    mapRawToDisplay(touchpad_x[0], touchpad_y[0], &dispX, &dispY);
+
+    data->point.x = dispX;
+    data->point.y = dispY;
+    data->state   = LV_INDEV_STATE_PR;
+
+    s_last_x = dispX;
+    s_last_y = dispY;
+    s_last_ts = now;
+    s_last_pressed = true;
+
+    pm_mark_user_activity();
+  } else {
+    if (s_last_pressed && (now - s_last_ts) < Config::LVGL_TOUCH_HOLDOVER_MS) {
+      data->point.x = s_last_x;
+      data->point.y = s_last_y;
+      data->state   = LV_INDEV_STATE_PR;
+    } else {
+      data->state = LV_INDEV_STATE_REL;
+      s_last_pressed = false;
+    }
+  }
+}
+
+void Lvgl_TickHandler(void *arg) {
+  (void)arg;
+  lv_tick_inc(LVGL_UPDATE_TICK_MS);
+}
+
+void Lvgl_Init(void) {
+  const int lvgl_buf_len = (platform.display_width * platform.display_height * Config::LVGL_BUF_FRAC_NUM) / Config::LVGL_BUF_FRAC_DEN;
+
+  buf1 = (lv_color_t *)heap_caps_malloc(lvgl_buf_len * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (!buf1) {
+      LOGE("LVGL DMA Buffer 1 allocation FAILED!");
+      while (true) { delay(1000); }
+  }
+  
+  buf2 = (lv_color_t *)heap_caps_malloc(lvgl_buf_len * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (!buf2) {
+      LOGW("LVGL DMA Buffer 2 allocation failed, continuing with one buffer.");
+  }
+
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, lvgl_buf_len);
+
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res      = platform.display_width;
+  disp_drv.ver_res      = platform.display_height;
+  disp_drv.flush_cb     = Lvgl_Display_LCD;
+  disp_drv.full_refresh = Config::LVGL_FULL_REFRESH ? 1 : 0;
+  disp_drv.draw_buf     = &draw_buf;
+  disp_drv.monitor_cb   = Lvgl_Monitor;
+  lv_disp_drv_register(&disp_drv);
+
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type    = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = Lvgl_Touchpad_Read;
+  lv_indev_drv_register(&indev_drv);
+
+  const esp_timer_create_args_t lvgl_tick_timer_args = {
+    .callback = &Lvgl_TickHandler,
+    .arg      = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name     = "lvgl_tick"
+  };
+  esp_timer_handle_t lvgl_tick_timer = nullptr;
+  if (esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer) != ESP_OK) {
+    LOGE("esp_timer_create(lvgl_tick) failed!");
+    while (true) { delay(1000); }
+  }
+  if (esp_timer_start_periodic(lvgl_tick_timer, LVGL_UPDATE_TICK_MS * 1000) != ESP_OK) {
+    LOGE("esp_timer_start_periodic(lvgl_tick) failed!");
+    while (true) { delay(1000); }
+  }
+
+  if (Config::UI_DEBUG_OVERLAY) {
+    s_dbg_label = lv_label_create(lv_layer_top());
+    lv_label_set_text(s_dbg_label, "0/0/0k");
+    lv_obj_set_style_text_color(s_dbg_label, lv_color_hex(Config::UI_DEBUG_COLOR_HEX), 0);
+    lv_obj_set_style_text_opa(s_dbg_label, Config::UI_DEBUG_TEXT_OPA, 0);
+    lv_obj_set_style_bg_opa(s_dbg_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(s_dbg_label, 0, 0);
+    lv_obj_align(s_dbg_label, LV_ALIGN_TOP_RIGHT, Config::UI_DEBUG_OFFSET_X, Config::UI_DEBUG_OFFSET_Y);
+    if (Config::UI_DEBUG_TRY_BIG_FONT) {
+    #if LV_FONT_MONTSERRAT_20
+      lv_obj_set_style_text_font(s_dbg_label, &lv_font_montserrat_20, 0);
+    #elif LV_FONT_MONTSERRAT_18
+      lv_obj_set_style_text_font(s_dbg_label, &lv_font_montserrat_18, 0);
+    #elif LV_FONT_MONTSERRAT_16
+      lv_obj_set_style_text_font(s_dbg_label, &lv_font_montserrat_16, 0);
+    #endif
+    }
+    s_dbg_timer = lv_timer_create(dbg_timer_cb, Config::UI_DEBUG_UPDATE_MS, nullptr);
+    lv_timer_set_repeat_count(s_dbg_timer, -1);
+  }
+}
+
+void Lvgl_Loop(void) {
+  if (s_loop_window_start_us == 0) s_loop_window_start_us = esp_timer_get_time();
+  uint64_t t0 = esp_timer_get_time();
+  lv_timer_handler();
+  uint64_t t1 = esp_timer_get_time();
+  s_loop_busy_us_acc += (t1 - t0);
+  uint64_t win = t1 - s_loop_window_start_us;
+  if (win >= 1000000ULL) {
+    uint64_t pct = (s_loop_busy_us_acc * 100ULL) / (win ? win : 1ULL);
+    if (pct > 100ULL) pct = 100ULL;
+    s_loop_cpu_pct = static_cast<uint8_t>(pct);
+    s_loop_busy_us_acc = 0;
+    s_loop_window_start_us = t1;
+  }
+}
+
+void Lvgl_GetRenderStats(LvglRenderStats* out) {
+  if (!out) return;
+  LvglRenderStats r{};
+  r.samples = s_rs_samples;
+  if (s_rs_samples > 0) {
+    r.ms_avg       = (uint32_t)(s_rs_ms_sum / s_rs_samples);
+    r.ms_max       = s_rs_ms_max;
+    r.px_avg       = (uint32_t)(s_rs_px_sum / s_rs_samples);
+    r.fill_pct_avg = (uint16_t)(s_rs_fill_pct_sum / s_rs_samples);
+  } else {
+    r.ms_avg = r.ms_max = r.px_avg = r.fill_pct_avg = 0;
+  }
+  r.full_flush_cnt = s_rs_full_flush_cnt;
+  *out = r;
+}
+
+void Lvgl_ResetRenderStats() {
+  s_rs_ms_sum = 0;
+  s_rs_ms_max = 0;
+  s_rs_px_sum = 0;
+  s_rs_samples = 0;
+  s_rs_fill_pct_sum = 0;
+  s_rs_full_flush_cnt = 0;
+}

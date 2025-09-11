@@ -1,0 +1,19 @@
+{
+    "bundle":  "bundle_014.txt",
+    "total_code_len":  19338,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\screens.cpp [part 3/3]",
+                      "code_len":  2675
+                  },
+                  {
+                      "rel":  "src\\SD_Karten_Treiber.cpp",
+                      "code_len":  15594
+                  },
+                  {
+                      "rel":  "src\\styles.cpp",
+                      "code_len":  1069
+                  }
+              ]
+}

@@ -1,0 +1,19 @@
+{
+    "bundle":  "bundle_009.txt",
+    "total_code_len":  12750,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\log\\log_recovery_export.cpp [part 3/3]",
+                      "code_len":  3953
+                  },
+                  {
+                      "rel":  "src\\log\\log_state.cpp",
+                      "code_len":  254
+                  },
+                  {
+                      "rel":  "src\\LVGL_Treiber.cpp",
+                      "code_len":  8673
+                  }
+              ]
+}

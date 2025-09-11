@@ -1,0 +1,39 @@
+{
+    "bundle":  "bundle_002.txt",
+    "total_code_len":  17940,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "include\\PlatformConfig.h",
+                      "code_len":  1989
+                  },
+                  {
+                      "rel":  "include\\RTC_PCF85063.h",
+                      "code_len":  2527
+                  },
+                  {
+                      "rel":  "include\\runtime_globals.h",
+                      "code_len":  88
+                  },
+                  {
+                      "rel":  "include\\runtime_tasks.h",
+                      "code_len":  3431
+                  },
+                  {
+                      "rel":  "include\\screens.h",
+                      "code_len":  5582
+                  },
+                  {
+                      "rel":  "include\\SD_Karten_Treiber.h",
+                      "code_len":  2122
+                  },
+                  {
+                      "rel":  "include\\styles.h",
+                      "code_len":  410
+                  },
+                  {
+                      "rel":  "include\\Task_Ticker.h",
+                      "code_len":  2024
+                  }
+              ]
+}

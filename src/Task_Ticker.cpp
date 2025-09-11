@@ -1,0 +1,387 @@
+#include "Task_Ticker.h"
+#include "Log.h"   
+#include <string.h>
+#include <stdio.h>
+#include <atomic>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#ifndef TASK_TICKER_DEFAULT_BUDGET_US
+#define TASK_TICKER_DEFAULT_BUDGET_US 4000u  
+#endif
+
+static portMUX_TYPE g_ticker_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static std::atomic<uint32_t> g_task_drops_total{0};
+static TaskDropCallback g_on_task_drop = nullptr;
+
+static unsigned long g_tick_budget_us     = TASK_TICKER_DEFAULT_BUDGET_US;
+static bool          g_budget_warned_once = false;
+
+static bool          g_overrun_warned[MAX_TASKS]   = {false};
+static unsigned long g_last_runtime_us[MAX_TASKS]  = {0};
+
+static unsigned long g_loop_last_us = 0;   
+static uint32_t      g_overruns_cnt = 0; 
+
+static ScheduledTask taskList[MAX_TASKS];
+static bool g_initialized = false;
+static char g_anon_task_names[MAX_TASKS][12]; 
+
+static void _ticker_selftest_noop() {}
+
+static inline void ensureInit() {
+    if (g_initialized) return;
+    LOG_INIT_BEGIN("Task-Ticker");
+    for (int i = 0; i < MAX_TASKS; ++i) {
+        taskList[i] = {0,0,nullptr,false,false,false,nullptr,0};
+        snprintf(g_anon_task_names[i], sizeof(g_anon_task_names[i]), "_anon.%d", i);
+    }
+    g_tick_budget_us     = TASK_TICKER_DEFAULT_BUDGET_US;
+    g_budget_warned_once = false;
+    g_initialized = true;
+    
+    const unsigned long now = millis();
+    bool ok_due_now   = ( (long)(now - now) >= 0 );
+    bool ok_not_yet   = ( (long)(now - (now + 1)) <  0 );
+    bool ok_in_past   = ( (long)(now - (now - 1)) >= 0 );
+    bool ok_all_free0 = (task_slots_free() == MAX_TASKS);
+
+    int tid = addTaskNamed("selftest", 0, _ticker_selftest_noop, false);
+    bool ok_added     = (tid >= 0);
+    if (ok_added) removeTask(tid);
+    bool ok_all_free1 = (task_slots_free() == MAX_TASKS);
+
+    if (ok_due_now && ok_not_yet && ok_in_past && ok_all_free0 && ok_added && ok_all_free1) {
+        LOG_INIT_READY("Task-Ticker");
+    } else {
+        LOG_INIT_FAIL("Task-Ticker", "selftest");
+    }
+}
+
+static inline bool isDue(unsigned long now, unsigned long due) {
+    return (long)(now - due) >= 0;
+}
+
+
+
+// --- KORRIGIERTE Implementierung der veralteten APIs ---
+
+int addTask(unsigned long delayMs, TaskCallback cb, bool repeat) {
+    ensureInit();
+    // Ruft direkt die moderne Kernfunktion auf
+    int slot = addTaskPhasedNamed(nullptr, delayMs, delayMs, cb, repeat);
+    if(slot >= 0) {
+        portENTER_CRITICAL(&g_ticker_mux);
+        taskList[slot].name = g_anon_task_names[slot];
+        portEXIT_CRITICAL(&g_ticker_mux);
+    }
+    return slot;
+}
+
+int addTaskPhased(unsigned long initialDelayMs, unsigned long intervalMs, TaskCallback cb, bool repeat) {
+    ensureInit();
+    // Ruft direkt die moderne Kernfunktion auf
+    int slot = addTaskPhasedNamed(nullptr, initialDelayMs, intervalMs, cb, repeat);
+    if(slot >= 0) {
+        portENTER_CRITICAL(&g_ticker_mux);
+        taskList[slot].name = g_anon_task_names[slot];
+        portEXIT_CRITICAL(&g_ticker_mux);
+    }
+    return slot;
+}
+
+int addTaskImmediate(unsigned long intervalMs, TaskCallback cb, bool repeat) {
+    ensureInit();
+    // Ruft direkt die moderne Kernfunktion auf und umgeht die Kette
+    int slot = addTaskPhasedNamed(nullptr, 0, intervalMs, cb, repeat);
+    if(slot >= 0) {
+        portENTER_CRITICAL(&g_ticker_mux);
+        taskList[slot].name = g_anon_task_names[slot];
+        portEXIT_CRITICAL(&g_ticker_mux);
+    }
+    return slot;
+}
+
+// ---------------------------------------------------------
+
+void removeTask(int taskId) {
+    ensureInit();
+    if (taskId < 0 || taskId >= MAX_TASKS) return;
+    portENTER_CRITICAL(&g_ticker_mux);
+    taskList[taskId].active   = false;
+    taskList[taskId].callback = nullptr;
+    taskList[taskId].interval = 0;
+    taskList[taskId].running  = false;
+    taskList[taskId].name     = nullptr;
+    taskList[taskId].nextRun  = 0;
+    taskList[taskId].overrun_count = 0;
+    g_overrun_warned[taskId]  = false;
+    g_last_runtime_us[taskId] = 0;
+    portEXIT_CRITICAL(&g_ticker_mux);
+}
+
+void updateTaskInterval(int taskId, unsigned long newInterval) {
+    ensureInit();
+    if (taskId < 0 || taskId >= MAX_TASKS) return;
+    portENTER_CRITICAL(&g_ticker_mux);
+    if (taskList[taskId].active) {
+        taskList[taskId].interval = newInterval;
+        taskList[taskId].nextRun = millis() + newInterval;
+        g_overrun_warned[taskId] = false;
+        taskList[taskId].overrun_count = 0;
+    }
+    portEXIT_CRITICAL(&g_ticker_mux);
+}
+
+void task_ticker_loop() {
+    ensureInit();
+    const unsigned long loop_start_us = micros();
+
+    for (int i = 0; i < MAX_TASKS; i++) {
+        unsigned long now = millis();
+        TaskCallback cb_to_run = nullptr;
+        const char* task_name = nullptr;
+        
+        portENTER_CRITICAL(&g_ticker_mux);
+        auto &t = taskList[i];
+        if (t.active && !t.running && isDue(now, t.nextRun)) {
+            t.running = true;
+            cb_to_run = t.callback;
+            task_name = t.name;
+        }
+        portEXIT_CRITICAL(&g_ticker_mux);
+
+        if (cb_to_run) {
+            const unsigned long cb_start_us = micros();
+            cb_to_run();
+            const unsigned long cb_runtime_us = micros() - cb_start_us;
+
+            portENTER_CRITICAL(&g_ticker_mux);
+            auto &t = taskList[i]; 
+            g_last_runtime_us[i] = cb_runtime_us;
+
+            if (t.interval > 0 && cb_runtime_us > t.interval * 1000ul) {
+                g_overruns_cnt++;
+                t.overrun_count++;
+                if (!g_overrun_warned[i]) {
+                    LOGW_T("sched", "Overrun in '%s' (runtime=%luus > interval=%lums)",
+                        task_name, cb_runtime_us, t.interval);
+                    g_overrun_warned[i] = true;
+                }
+            }
+
+            if (!t.active) {
+                t.running = false;
+            } else if (t.repeat && t.interval > 0) {
+                do { t.nextRun += t.interval; } while (isDue(now, t.nextRun));
+                t.running = false;
+            } else {
+                portEXIT_CRITICAL(&g_ticker_mux);
+                removeTask(i);
+                portENTER_CRITICAL(&g_ticker_mux);
+            }
+            portEXIT_CRITICAL(&g_ticker_mux);
+            
+            if ((micros() - loop_start_us) > g_tick_budget_us) {
+                if (!g_budget_warned_once) {
+                    LOGW_T("sched", "Task-Ticker budget of %lu us exceeded", g_tick_budget_us);
+                    g_budget_warned_once = true;
+                }
+                break; 
+            }
+        }
+    }
+    g_loop_last_us = micros() - loop_start_us;
+}
+
+int addTaskNamed(const char* name, unsigned long delayMs, TaskCallback cb, bool repeat) {
+    return addTaskPhasedNamed(name, delayMs, delayMs, cb, repeat);
+}
+
+int addTaskPhasedNamed(const char* name, unsigned long initialDelayMs, unsigned long intervalMs, TaskCallback cb, bool repeat) {
+    ensureInit();
+    if (!cb) return -1;
+    if (!name || *name == '\0') {
+        LOGW_T("sched", "addTaskPhasedNamed: Anonymer Task wurde angefordert. Bitte benannte API verwenden.");
+    }
+    
+    portENTER_CRITICAL(&g_ticker_mux);
+    
+    int task_id = -1;
+    if (name && *name != '\0') {
+        int existing_id = -1;
+        for (int i = 0; i < MAX_TASKS; ++i) {
+            if (taskList[i].active && taskList[i].name && strcmp(taskList[i].name, name) == 0) {
+                existing_id = i;
+                break;
+            }
+        }
+
+        if (existing_id != -1) {
+            LOGD_T("sched", "Task '%s' aktualisiert: Intervall %lu->%lu ms, Repeat %d->%d",
+                   name, taskList[existing_id].interval, intervalMs,
+                   (int)taskList[existing_id].repeat, (int)repeat);
+            
+            taskList[existing_id].interval = intervalMs;
+            taskList[existing_id].nextRun = millis() + initialDelayMs;
+            taskList[existing_id].callback = cb;
+            taskList[existing_id].repeat = repeat;
+            g_overrun_warned[existing_id] = false;
+            g_last_runtime_us[existing_id] = 0;
+            taskList[existing_id].overrun_count = 0;
+            task_id = existing_id;
+        }
+    }
+
+    if (task_id == -1) {
+        int free_slot = -1;
+        for (int i = 0; i < MAX_TASKS; i++) {
+            if (!taskList[i].active) {
+                free_slot = i;
+                break;
+            }
+        }
+        
+        if (free_slot != -1) {
+            taskList[free_slot].nextRun = millis() + initialDelayMs;
+            taskList[free_slot].interval = intervalMs;
+            taskList[free_slot].callback = cb;
+            taskList[free_slot].repeat = repeat;
+            taskList[free_slot].active = true;
+            taskList[free_slot].running = false;
+            taskList[free_slot].name = name;
+            taskList[free_slot].overrun_count = 0;
+            g_overrun_warned[free_slot] = false;
+            g_last_runtime_us[free_slot] = 0;
+            task_id = free_slot;
+        } else {
+            g_task_drops_total++;
+            TaskDropCallback drop_cb = g_on_task_drop;
+            portEXIT_CRITICAL(&g_ticker_mux);
+            
+            LOGE_T("sched", "addTaskPhasedNamed: keine freien Slots für Task '%s'", (name ? name : "<unnamed>"));
+            if (drop_cb) {
+                drop_cb(name);
+            }
+            return -1;
+        }
+    }
+    
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return task_id;
+}
+
+int addTaskImmediateNamed(const char* name, unsigned long intervalMs, TaskCallback cb, bool repeat) {
+    return addTaskPhasedNamed(name, 0, intervalMs, cb, repeat);
+}
+
+void dump_tasks() {
+    ensureInit();
+    
+    struct TaskSnapshot {
+        ScheduledTask task;
+        unsigned long last_runtime_us;
+    };
+    TaskSnapshot snapshot[MAX_TASKS];
+    unsigned long now;
+    int active_count, free_slots;
+
+    portENTER_CRITICAL(&g_ticker_mux);
+    now = millis();
+    active_count = 0;
+    free_slots = 0;
+    for(int i=0; i < MAX_TASKS; ++i) {
+        snapshot[i].task = taskList[i];
+        snapshot[i].last_runtime_us = g_last_runtime_us[i];
+        if (taskList[i].active) active_count++; else free_slots++;
+    }
+    portEXIT_CRITICAL(&g_ticker_mux);
+
+    LOGI("--- Task-Ticker Dump (Active: %d, Free: %d) ---", active_count, free_slots);
+    LOGI("Budget: %lu us, Last Loop: %lu us, Overruns (total): %lu, Drops: %u",
+        getTickBudgetMs() * 1000UL, getTickerLoopLastUs(), getTickerOverrunsCount(), getTaskDropsCount());
+
+    for (int i = 0; i < MAX_TASKS; ++i) {
+        const auto &s = snapshot[i];
+        if (!s.task.active) continue;
+        long due_in_ms = (long)(s.task.nextRun - now);
+        LOGI("  [%d] '%s': Due in %ld ms, Int: %lu ms, Rpt: %d, Run: %d, LastT: %lu us, Overruns: %lu",
+             i, (s.task.name ? s.task.name : "<unnamed>"), due_in_ms, s.task.interval, 
+             (int)s.task.repeat, (int)s.task.running, s.last_runtime_us, s.task.overrun_count);
+    }
+    LOGI("---------------------------------------------");
+}
+
+void setTickBudgetMs(uint16_t ms) {
+    ensureInit();
+    portENTER_CRITICAL(&g_ticker_mux);
+    g_tick_budget_us = (unsigned long)ms * 1000ul;
+    g_budget_warned_once = false;
+    portEXIT_CRITICAL(&g_ticker_mux);
+}
+
+int task_slots_free() {
+    ensureInit();
+    int freeCnt = 0;
+    portENTER_CRITICAL(&g_ticker_mux);
+    for (int i = 0; i < MAX_TASKS; ++i) if (!taskList[i].active) ++freeCnt;
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return freeCnt;
+}
+
+int task_count_active() {
+    ensureInit();
+    int used = 0;
+    portENTER_CRITICAL(&g_ticker_mux);
+    for (int i = 0; i < MAX_TASKS; ++i) if (taskList[i].active) ++used;
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return used;
+}
+
+uint16_t getTickBudgetMs() {
+    portENTER_CRITICAL(&g_ticker_mux);
+    uint16_t budget = (uint16_t)(g_tick_budget_us / 1000u);
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return budget;
+}
+
+unsigned long getTickerLoopLastUs() {
+    portENTER_CRITICAL(&g_ticker_mux);
+    unsigned long last_us = g_loop_last_us;
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return last_us;
+}
+
+uint32_t getTickerOverrunsCount() {
+    portENTER_CRITICAL(&g_ticker_mux);
+    uint32_t count = g_overruns_cnt;
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return count;
+}
+
+long getTaskLastRuntimeUs(int taskId) {
+    if (taskId < 0 || taskId >= MAX_TASKS) return -1;
+    portENTER_CRITICAL(&g_ticker_mux);
+    long runtime = (long)g_last_runtime_us[taskId];
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return runtime;
+}
+
+uint32_t getTaskOverrunCount(int taskId) {
+    if (taskId < 0 || taskId >= MAX_TASKS) return 0;
+    portENTER_CRITICAL(&g_ticker_mux);
+    uint32_t count = taskList[taskId].overrun_count;
+    portEXIT_CRITICAL(&g_ticker_mux);
+    return count;
+}
+
+uint32_t getTaskDropsCount() {
+    return g_task_drops_total.load();
+}
+
+void setTaskDropCallback(TaskDropCallback cb) {
+    portENTER_CRITICAL(&g_ticker_mux);
+    g_on_task_drop = cb;
+    portEXIT_CRITICAL(&g_ticker_mux);
+}

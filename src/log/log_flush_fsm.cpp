@@ -1,0 +1,581 @@
+/* === BEGIN FILE: src\log\log_flush_fsm.cpp === */
+
+#include "log_internal.hpp"
+#include "Konfiguration.h"
+#include "RTC_PCF85063.h"
+#include "fs_policy.h"
+#include "fs_paths.h"
+#include "SD_Karten_Treiber.h"
+#include "runtime_tasks.h"
+
+#include <Arduino.h>
+#include <string.h>
+#include <string>
+#include <limits.h>
+#include <time.h>
+
+namespace log_internal {
+
+// --- Interne Helfer ---
+
+static constexpr uint32_t SD_IO_COOLDOWN_MS = 600;
+static constexpr uint32_t FLUSH_BUDGET_MS   = 12;
+
+enum { EV_BP_ON=1u<<0, EV_BP_OFF=1u<<1, EV_UART_ON=1u<<2, EV_UART_OFF=1u<<3 };
+
+struct LogFileHeader {
+    uint32_t magic; 
+    uint8_t  version; 
+    uint8_t  reserved[3];
+    uint64_t anchor_boot_us; 
+    int64_t  anchor_wall_us_offset; 
+    uint32_t crc32;
+};
+static constexpr uint32_t LOG_FILE_HEADER_MAGIC = 0x474F4C48;
+
+static constexpr uint32_t LOG_PAGE_MAGIC = 0x474F4C50;
+static constexpr uint32_t LOG_PAGE_SIZE = 4096;
+
+struct LogPageHdr {
+    uint32_t magic;
+    uint32_t page_seq;
+    uint32_t payload_len;
+    uint32_t payload_crc32;
+} __attribute__((packed));
+
+struct LogTail {
+    uint32_t version;
+    uint32_t tail_seq;
+    uint32_t offset;
+    uint32_t crc32;
+} __attribute__((packed));
+
+static void fs_dirbar_touch(const char* dir) {
+    if (!dir) return;
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", dir, FsSpecial::DIRBAR_BASENAME);
+    File f = fs_open_final(path, "a");
+    if (f) {
+        fs_fsync(f);
+        f.close();
+    }
+}
+
+void log_fs_hook_cb(const char* r){
+  telemetry_event("fs_flush_hook", r ? r : "none");
+  flush(r);
+}
+
+static bool log_start_new_day(); // Forward declaration
+
+// --- Implementierung ---
+
+void force_flush(void) {
+    state().flush_request_pending.store(true, std::memory_order_relaxed);
+    run_flush_fsm();
+}
+
+void rotate_maybe(void){
+  auto& s = state();
+  if (!s.log_day_is_active) return;
+
+  bool should_rotate = (s.current_log_offset >= CFG_LOG_PREALLOC_BYTES);
+
+  if(!should_rotate && CFG_LOG_ROTATE_24H && rtc_is_valid()){
+    static int last_day = 0;
+    datetime_t now;
+    RTC_PCF85063_Read_Time(&now);
+    if (last_day == 0) last_day = now.day;
+    if (now.day != last_day) {
+        should_rotate = true;
+        last_day = now.day;
+    }
+  }
+
+  if (should_rotate) {
+    char path_to_export[sizeof(s.active_log_basename) + 5];
+    snprintf(path_to_export, sizeof(path_to_export), "%s.tmp", s.active_log_basename);
+
+    LOGI_T("log", "Tagesrotation: Finalisiere %s für Export.", path_to_export);
+
+    if (s.log_day_is_active) {
+        force_flush();
+        if (sd_global_io_lock(1000)) {
+            if (s.active_log_tmp_file) {
+                s.active_log_tmp_file.close();
+            }
+            s.log_day_is_active = false;
+            sd_global_io_unlock();
+        } else {
+            LOGE_T("log", "Konnte Lock für Tagesabschluss nicht erhalten!");
+        }
+    }
+
+    sd_job_t job;
+    job.reason = SD_UPDATE_REASON_FINALIZE_DAY;
+    strncpy(job.payload, path_to_export, sizeof(job.payload) - 1);
+    job.payload[sizeof(job.payload) - 1] = '\0';
+    sd_request_job(job);
+    
+    log_start_new_day();
+  }
+}
+
+bool log_commit_tail() {
+    auto& s = state();
+    LfnTempScope scope;
+    char tail_path_tmp[108];
+    
+    const char* target_path = ((s.current_tail_seq + 1) % 2 == 0) ? FsFinalPath::LOG_IDXS[1] : FsFinalPath::LOG_IDXS[0];
+    snprintf(tail_path_tmp, sizeof(tail_path_tmp), "%s.part", target_path); 
+
+    LogTail tail;
+    tail.version = 1;
+    tail.tail_seq = ++s.current_tail_seq;
+    tail.offset = s.current_log_offset;
+    tail.crc32 = crc32_update(0, &tail, sizeof(LogTail) - sizeof(uint32_t));
+
+    File f = fs_open_temp(scope, tail_path_tmp, "w");
+    if (!f || f.write((uint8_t*)&tail, sizeof(tail)) != sizeof(tail)) {
+        if(f) f.close();
+        fs_policy_remove(tail_path_tmp);
+        telemetry_event("tail_commit_fail", "write");
+        return false;
+    }
+    fs_fsync(f);
+    f.close();
+    
+    fs_policy_remove(target_path); 
+    
+    if (!fs_policy_rename(scope, tail_path_tmp, target_path)) {
+        fs_policy_remove(tail_path_tmp);
+        telemetry_event("tail_commit_fail", "rename");
+        return false;
+    }
+
+    fs_dirbar_touch("/log");
+    return true;
+}
+
+void run_flush_fsm(void){
+  auto& s = state();
+  std::lock_guard<std::mutex> lock(s.flush_mutex);
+
+  if (telemetry_sd_is_stale()) {
+      sd_request_update(SD_UPDATE_REASON_MANUAL);
+      return;
+  }
+
+  if (s.close_file_pending.exchange(false, std::memory_order_acq_rel)) {
+      if (s.sd_mounted.load(std::memory_order_relaxed)) {
+          if (sd_global_io_lock(100)) {
+              if (s.active_log_tmp_file) s.active_log_tmp_file.close();
+              sd_global_io_unlock();
+          }
+      }
+      s.active_log_tmp_file = File();
+      s.log_day_is_active = false;
+  }
+
+  if (s.recover_pending.exchange(false, std::memory_order_acq_rel)) {
+      recover_on_boot();
+  }
+
+  if (!s.sd_mounted.load(std::memory_order_relaxed)) {
+      return;
+  }
+
+  const uint32_t now = millis();
+  if (now - s.sd_evt_ms.load(std::memory_order_relaxed) < SD_IO_COOLDOWN_MS) return;
+
+  uint32_t temp_used_pct;
+  size_t head_snap, tail_snap;
+
+  portENTER_CRITICAL(&s.ring_spinlock);
+  head_snap = s.ring_head;
+  tail_snap = s.ring_tail;
+  temp_used_pct = (get_ring_used_unsafe()*100)/CFG_LOG_RING_BYTES;
+  bool is_empty = (head_snap == tail_snap);
+  portEXIT_CRITICAL(&s.ring_spinlock);
+
+  const uint32_t interval = (temp_used_pct > 50) ? CFG_LOG_FLUSH_MS_BURST : CFG_LOG_FLUSH_MS_BASE;
+  bool should = s.flush_request_pending.load() && (now-s.last_flush_ms >= interval);
+  should |= (now-s.last_flush_ms >= CFG_LOG_FLUSH_MAX_GAP_MS);
+
+  if(!should || is_empty) return;
+
+  if (!s.log_day_is_active) {
+      if (!log_start_new_day()) {
+          LOGW_T("log", "Konnte neuen Log-Tag nicht starten. SD-Problem?");
+          return;
+      }
+  }
+
+  if (s.log_day_is_active && (s.current_log_offset >= CFG_LOG_PREALLOC_BYTES)) {
+      telemetry_event("rotate_prealloc_exhaust", NULL);
+      rotate_maybe();
+      return;
+  }
+
+  uint32_t ev=s.evt_bits.exchange(0);
+  if (ev & (EV_BP_ON | EV_BP_OFF)) {
+      char detail_buf[32];
+      snprintf(detail_buf, sizeof(detail_buf), "{ring_pct:%u}", (unsigned)temp_used_pct);
+      if(ev & EV_BP_ON)  telemetry_event("log_backpressure_start", detail_buf);
+      if(ev & EV_BP_OFF) telemetry_event("log_backpressure_end", detail_buf);
+  }
+  if (ev & EV_UART_ON)  telemetry_event("log_uart_fallback","{on:1}");
+  if (ev & EV_UART_OFF) telemetry_event("log_uart_fallback","{on:0}");
+
+  if (!sd_global_io_lock(5)) {
+    s.flush_request_pending.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  if (s.sd_abort.load(std::memory_order_relaxed) || !s.sd_mounted.load(std::memory_order_relaxed)) {
+    sd_global_io_unlock();
+    return;
+  }
+
+  static uint8_t page_buffer[LOG_PAGE_SIZE];
+  uint32_t page_offset;
+
+  const uint32_t start_ms = millis();
+  bool page_written = false;
+
+  size_t tail_new = tail_snap;
+
+  while (tail_new != head_snap) {
+    if ((millis() - start_ms) >= FLUSH_BUDGET_MS) break;
+
+    memset(page_buffer, 0, sizeof(page_buffer));
+    page_offset = sizeof(LogPageHdr);
+
+    portENTER_CRITICAL(&s.ring_spinlock);
+    size_t ring_used = (head_snap >= tail_new) ? (head_snap - tail_new) : (CFG_LOG_RING_BYTES - tail_new + head_snap);
+    size_t can_write_to_page = LOG_PAGE_SIZE - page_offset;
+    size_t to_read = std::min(ring_used, can_write_to_page);
+
+    if (to_read == 0) {
+        portEXIT_CRITICAL(&s.ring_spinlock);
+        break;
+    }
+
+    if (!s.log_header_anchored && s.current_log_offset == sizeof(LogFileHeader)) {
+        size_t temp_tail = tail_new;
+        LogHdr first_entry;
+        ring_read_at(&temp_tail, &first_entry, sizeof(first_entry));
+        
+        LogFileHeader hdr;
+        hdr.magic = LOG_FILE_HEADER_MAGIC;
+        hdr.version = 2;
+        hdr.reserved[0] = hdr.reserved[1] = hdr.reserved[2] = 0;
+        hdr.anchor_boot_us = first_entry.ts_us;
+
+        int64_t off;
+        if (rtc_is_valid() && rtc_get_wall_boot_offset_us(&off)) {
+            hdr.anchor_wall_us_offset = off;
+            s.wall_offset_us = off;
+            s.log_header_anchored = true;
+            s.header_needs_reanchor = false;
+        } else {
+            hdr.anchor_wall_us_offset = 0;
+            s.wall_offset_us = 0;
+            s.log_header_anchored = false;
+            s.header_needs_reanchor = true;
+        }
+        
+        hdr.crc32 = 0;
+        hdr.crc32 = crc32_update(0, &hdr, sizeof(hdr) - sizeof(uint32_t));
+        
+        s.active_log_tmp_file.seek(0);
+        s.active_log_tmp_file.write((uint8_t*)&hdr, sizeof(hdr));
+    }
+
+    ring_read_at(&tail_new, page_buffer + page_offset, to_read);
+    page_offset += to_read;
+    portEXIT_CRITICAL(&s.ring_spinlock);
+
+    if (page_offset > sizeof(LogPageHdr)) {
+        LogPageHdr hdr;
+        hdr.magic = LOG_PAGE_MAGIC;
+        hdr.page_seq = s.current_page_seq + 1;
+        hdr.payload_len = page_offset - sizeof(LogPageHdr);
+        hdr.payload_crc32 = crc32_update(0, page_buffer + sizeof(LogPageHdr), hdr.payload_len);
+        memcpy(page_buffer, &hdr, sizeof(hdr));
+
+        s.active_log_tmp_file.seek(s.current_log_offset);
+        if (s.active_log_tmp_file.write(page_buffer, LOG_PAGE_SIZE) == LOG_PAGE_SIZE) {
+            fs_fsync(s.active_log_tmp_file);
+            s.current_log_offset += LOG_PAGE_SIZE;
+            s.current_page_seq++;
+
+            if (log_commit_tail()) {
+                page_written = true;
+                s.last_flush_ms = millis();
+                s.last_flushed_level = s.last_enqueued_level;
+                portENTER_CRITICAL(&s.ring_spinlock);
+                s.ring_tail = tail_new;
+                portEXIT_CRITICAL(&s.ring_spinlock);
+            } else {
+                LOGE_T("log", "Tail-Commit fehlgeschlagen!");
+                break;
+            }
+        } else {
+            LOGE_T("log", "Fehler beim Schreiben der Log-Page! Karte entfernt?");
+            sd_global_io_unlock();
+            sd_status_changed(false);
+            return;
+        }
+    }
+  }
+
+  portENTER_CRITICAL(&s.ring_spinlock);
+  bool drained = (s.ring_tail == head_snap);
+  portEXIT_CRITICAL(&s.ring_spinlock);
+
+  if (drained) s.flush_request_pending.store(false, std::memory_order_relaxed);
+
+  sd_global_io_unlock();
+  if (page_written) rotate_maybe();
+}
+
+void sd_status_changed(bool mounted_ok){
+  auto& s = state();
+  std::lock_guard<std::mutex> lock(s.flush_mutex);
+
+  s.sd_mounted.store(mounted_ok, std::memory_order_relaxed);
+  s.sd_evt_ms.store(millis(), std::memory_order_relaxed);
+
+  if (mounted_ok){
+    s.sd_abort.store(false, std::memory_order_relaxed);
+    s.last_flush_ms = millis();
+    s.flush_request_pending.store(true, std::memory_order_relaxed);
+    s.recover_pending.store(true, std::memory_order_release);
+  } else {
+    if (s.log_day_is_active) s.close_file_pending.store(true, std::memory_order_release);
+    s.sd_abort.store(true, std::memory_order_relaxed);
+    telemetry_event("sd_removed","1");
+  }
+}
+
+static bool log_start_new_day() {
+    auto& s = state();
+    if (!s.sd_mounted.load()) return false;
+
+    if (s.log_day_is_active) {
+        rotate_maybe();
+        return false;
+    }
+
+    datetime_t now;
+    RTC_PCF85063_Read_Time(&now);
+    snprintf(s.active_log_basename, sizeof(s.active_log_basename), "/log/L%02d%02d%02d", now.year % 100, now.month, now.day);
+
+    char tmp_path[96];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s.active_log_basename);
+
+    if (!sd_global_io_lock(2000)) return false;
+
+    File prealloc_file = fs_open_final(tmp_path, "r+");
+    if (prealloc_file && !prealloc_file.isDirectory() && 
+        prealloc_file.size() >= CFG_LOG_PREALLOC_BYTES &&
+        (prealloc_file.size() % LOG_PAGE_SIZE) == 0) {
+        LOGI_T("log", "Wiederverwendung der vom Bootloader vorallokierten Datei: %s", tmp_path);
+        s.active_log_tmp_file = prealloc_file;
+        s.current_log_offset = sizeof(LogFileHeader);
+        s.active_log_tmp_file.seek(s.current_log_offset);
+        s.current_page_seq = 0;
+        s.current_tail_seq = 0;
+        s.log_day_is_active = true;
+        s.log_header_anchored = false;
+        s.flush_request_pending.store(true, std::memory_order_relaxed);
+        fs_policy_remove(FsFinalPath::LOG_IDXS[0]);
+        fs_policy_remove(FsFinalPath::LOG_IDXS[1]);
+        sd_global_io_unlock();
+        return true;
+    }
+    if (prealloc_file) {
+        prealloc_file.close();
+    }
+
+    uint32_t free_mb = telemetry_fs_free_mb();
+    if (free_mb < CFG_LOG_PREALLOC_MB + 16) {
+        LOGE_T("log", "Nicht genügend Speicher für Prealloc: %u MB frei, %u MB benötigt.", (unsigned)free_mb, (unsigned)CFG_LOG_PREALLOC_MB);
+        telemetry_event("prealloc_fail", "no_space");
+        sd_global_io_unlock();
+        return false;
+    }
+
+    fs_policy_mkdir("/log");
+
+    fs_policy_remove(FsFinalPath::LOG_IDXS[0]);
+    fs_policy_remove(FsFinalPath::LOG_IDXS[1]);
+    fs_policy_remove(tmp_path);
+
+    s.active_log_tmp_file = fs_open_final(tmp_path, "w");
+    if (!s.active_log_tmp_file) {
+        sd_global_io_unlock();
+        return false;
+    }
+
+    LogFileHeader empty_header = {0};
+    s.active_log_tmp_file.write((uint8_t*)&empty_header, sizeof(empty_header));
+    s.log_header_anchored = false;
+
+    sd_global_io_unlock();
+
+    uint32_t start_ms = millis();
+    LOGI_T("log", "Vorallokiere %u MB für %s...", (unsigned)CFG_LOG_PREALLOC_MB, tmp_path);
+
+    if (!sd_preallocate_file(s.active_log_tmp_file, CFG_LOG_PREALLOC_BYTES)) {
+        LOGE_T("log", "Prealloc fehlgeschlagen!");
+        s.active_log_tmp_file.close();
+        fs_policy_remove(tmp_path);
+        return false;
+    }
+
+    uint32_t duration_ms = millis() - start_ms;
+    char detail[32];
+    snprintf(detail, sizeof(detail), "{ms:%u}", (unsigned)duration_ms);
+    telemetry_event("prealloc_ms", detail);
+
+    s.current_log_offset = sizeof(LogFileHeader);
+    s.active_log_tmp_file.seek(s.current_log_offset);
+    
+    s.current_page_seq = 0;
+    s.current_tail_seq = 0;
+    s.log_day_is_active = true;
+
+    // ====================================================================
+    // NEU: HIER WERDEN ALLE ARTEFAKTE SOFORT NACH DER ERSTELLUNG ANGELEGT
+    // ====================================================================
+    LOGI_T("log", "Initialisiere Log-Artefakte für stabilen Start...");
+    fs_dirbar_touch("/log"); // Erzeugt .DIRBAR
+    log_commit_tail();       // Erzeugt SYS0.IDX (oder SYS1.IDX)
+    log_commit_tail();       // Erzeugt die jeweils andere Indexdatei
+    // ====================================================================
+
+    LOGI_T("log", "Neuer Log-Tag gestartet: %s", s.active_log_basename);
+    return true;
+}
+
+void log_on_rtc_valid() {
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.flush_mutex);
+
+    if (!s.log_day_is_active || !s.header_needs_reanchor) {
+        return;
+    }
+
+    int64_t off;
+    if (!rtc_get_wall_boot_offset_us(&off)) {
+        return;
+    }
+    s.wall_offset_us = off;
+
+    if (!sd_global_io_lock(1000)) {
+        LOGE_T("log", "Konnte Lock für Header Re-Anchor nicht erhalten.");
+        return;
+    }
+
+    LogFileHeader hdr;
+    s.active_log_tmp_file.seek(0);
+    if (s.active_log_tmp_file.read((uint8_t*)&hdr, sizeof(hdr)) != sizeof(hdr)) {
+        LOGE_T("log", "Konnte Header für Re-Anchor nicht lesen.");
+        sd_global_io_unlock();
+        return;
+    }
+
+    hdr.anchor_wall_us_offset = off;
+    hdr.crc32 = 0;
+    hdr.crc32 = crc32_update(0, &hdr, sizeof(hdr) - sizeof(uint32_t));
+
+    s.active_log_tmp_file.seek(0);
+    s.active_log_tmp_file.write((uint8_t*)&hdr, sizeof(hdr));
+    fs_fsync(s.active_log_tmp_file);
+
+    sd_global_io_unlock();
+
+    s.header_needs_reanchor = false;
+    s.log_header_anchored = true;
+    telemetry_event("log_header_reanchored", NULL);
+    LOGI_T("RTC", "Log-Header wurde mit korrektem Zeit-Offset neu verankert.");
+}
+
+bool boot_preallocate(void) {
+    if (!rtc_is_valid()) {
+        LOGW_T("BOOT", "RTC ungültig, überspringe Pre-Allokation.");
+        return true;
+    }
+
+    datetime_t now; RTC_PCF85063_Read_Time(&now);
+    char tmp_path[96];
+    snprintf(tmp_path, sizeof(tmp_path), "/log/L%02d%02d%02d.tmp", now.year % 100, now.month, now.day);
+    
+    // KORREKTUR: Alle SD-Operationen müssen durch den globalen Lock geschützt sein.
+    if (!sd_global_io_lock(3000)) {
+        LOGE_T("BOOT", "Pre-Allocate konnte I/O-Lock nicht erhalten.");
+        return false;
+    }
+
+    File f_check = fs_open_final(tmp_path, "r");
+    if (f_check) {
+        if (f_check.size() >= CFG_LOG_PREALLOC_BYTES) {
+            f_check.close();
+            sd_global_io_unlock();
+            LOGI_T("BOOT", "Log-Datei existiert bereits und ist groß genug.");
+            return true;
+        }
+        f_check.close();
+    }
+
+    LOGI_T("BOOT", "Bereite Log-Datei vor...");
+    
+    // KORREKTUR: Rückgabewert von mkdir prüfen.
+    if (!fs_policy_mkdir("/log")) {
+        // Möglicherweise existiert das Verzeichnis schon, was kein Fehler ist.
+        // Wir prüfen, ob wir es jetzt öffnen können.
+        File dir_check = fs_open_final("/log", "r");
+        if (!dir_check) {
+            LOGE_T("BOOT", "Konnte Log-Verzeichnis '/log' nicht erstellen und es existiert nicht.");
+            sd_global_io_unlock();
+            return false;
+        }
+        dir_check.close();
+    }
+
+    File f = fs_open_final(tmp_path, "w");
+    if (!f) {
+        LOGE_T("BOOT", "Konnte Log-Datei '%s' für Pre-Allokation nicht öffnen.", tmp_path);
+        sd_global_io_unlock();
+        return false;
+    }
+    
+    // WICHTIG: Den Lock während der zeitintensiven Operation freigeben,
+    // da sd_preallocate_file seinen eigenen Lock-Mechanismus hat.
+    sd_global_io_unlock();
+
+    if (!sd_preallocate_file(f, CFG_LOG_PREALLOC_BYTES)) {
+        LOGE_T("BOOT", "Fehler bei der Pre-Allokation.");
+        // Lock holen, um sicher aufzuräumen
+        if(sd_global_io_lock(1000)) {
+            f.close();
+            fs_policy_remove(tmp_path);
+            sd_global_io_unlock();
+        }
+        return false;
+    }
+    
+    // Die Datei wird von sd_preallocate_file offen gelassen, hier schließen wir sie.
+    if(sd_global_io_lock(1000)) {
+        f.close();
+        sd_global_io_unlock();
+    }
+    
+    return true;
+}
+
+} // namespace log_internal
+
+/* === END FILE: src\log\log_flush_fsm.cpp === */

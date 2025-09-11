@@ -1,0 +1,19 @@
+{
+    "bundle":  "bundle_004.txt",
+    "total_code_len":  14128,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\Display_ST7789_Treiber.cpp",
+                      "code_len":  4666
+                  },
+                  {
+                      "rel":  "src\\fs_policy.cpp",
+                      "code_len":  9684
+                  },
+                  {
+                      "rel":  "src\\images.cpp",
+                      "code_len":  64
+                  }
+              ]
+}

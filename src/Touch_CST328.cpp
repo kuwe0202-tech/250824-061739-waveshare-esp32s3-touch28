@@ -1,0 +1,346 @@
+#include "Touch_CST328.h"
+#include "PlatformConfig.h"
+#include <math.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include "Log.h"
+#include "runtime_tasks.h"   
+
+CST328_Touch touch_data = { 0 };
+bool         touchInitialized = false;
+static volatile bool g_touch_reinit_pending = false;
+
+TouchPoint   touch_points[MAX_TOUCH_POINTS];
+uint8_t      active_touch_count = 0;
+uint8_t      last_active_count  = 0;
+
+GestureEvent last_gesture = { GestureType::None, 0, 0, 0.0f, 0, 0 };
+
+unsigned long last_tap_time = 0;
+uint16_t      last_tap_x = 0, last_tap_y = 0;
+
+const char*   current_state_text = "IDLE";
+
+static inline uint16_t uabs16(int v) { return (v < 0) ? (uint16_t)(-v) : (uint16_t)v; }
+
+extern void pm_mark_user_activity(void) __attribute__((weak));
+static inline void PM_MARK_USER_ACTIVITY() { if (pm_mark_user_activity) pm_mark_user_activity(); }
+
+static constexpr uint8_t TOUCH_I2C_ERR_THRESHOLD = 3;
+static uint8_t g_i2c_err_streak = 0;
+
+static void touch_recover_start() {
+    LOGW("Touch: Recovery scheduled due to persistent I2C errors.");
+    g_touch_reinit_pending = true;
+}
+
+bool touch_need_reinit() { return g_touch_reinit_pending; }
+void touch_clear_reinit() { g_touch_reinit_pending = false; }
+
+static inline void touch_i2c_ok()   { g_i2c_err_streak = 0; }
+static inline void touch_i2c_fail() {
+  if (++g_i2c_err_streak >= TOUCH_I2C_ERR_THRESHOLD) {
+    g_i2c_err_streak = 0;
+    touch_recover_start();
+  }
+  tel_i2c_on_retry();
+}
+
+static TwoWire& get_touch_bus() {
+    return (platform.i2c_port_touch == 1) ? Wire1 : Wire;
+}
+
+static bool Touch_I2C_Read_once(uint8_t addr, uint16_t reg, uint8_t *data, uint32_t length) {
+  TwoWire& bus = get_touch_bus();
+  bus.beginTransmission(addr);
+  bus.write((uint8_t)(reg >> 8));
+  bus.write((uint8_t)reg);
+  if (bus.endTransmission(true) != 0) return false;
+
+  bus.requestFrom((int)addr, (int)length);
+  for (uint32_t i = 0; i < length; i++) {
+    if (bus.available()) data[i] = bus.read();
+    else return false;
+  }
+  return true;
+}
+
+bool Touch_I2C_Read(uint8_t addr, uint16_t reg, uint8_t *data, uint32_t length) {
+  (void)addr;
+  if (!Touch_I2C_Read_once(platform.i2c_addr_touch, reg, data, length)) {
+    touch_i2c_fail();
+    tel_touch_on_error();     
+    return false;
+  }
+  touch_i2c_ok();
+  return true;
+}
+
+bool Touch_I2C_Write(uint8_t addr, uint16_t reg, const uint8_t *data, uint32_t length) {
+  (void)addr;
+  TwoWire& bus = get_touch_bus();
+  bus.beginTransmission(platform.i2c_addr_touch);
+  bus.write((uint8_t)(reg >> 8));
+  bus.write((uint8_t)reg);
+  for (uint32_t i = 0; i < length; i++) bus.write(data[i]);
+  if (bus.endTransmission(true) != 0) { touch_i2c_fail(); return false; }
+  touch_i2c_ok();
+  return true;
+}
+
+uint16_t CST328_Read_Config() {
+  uint8_t buf[24];
+  if (!Touch_I2C_Write(0, HYN_REG_MUT_DEBUG_INFO_MODE, buf, 0)) return 0;
+  if (Touch_I2C_Read(0, HYN_REG_MUT_DEBUG_INFO_TP_NTX, buf, 24)) {
+    uint16_t verification = (((uint16_t)buf[11] << 8) | buf[10]);
+    Touch_I2C_Write(0, HYN_REG_MUT_NORMAL_MODE, buf, 0);
+    return verification;
+  }
+  return 0;
+}
+
+bool Touch_Read_Data() {
+  if (!touchInitialized) return false;
+
+  uint8_t buf[41];
+  uint8_t clear = 0;
+
+  if (!Touch_I2C_Read(0, ESP_LCD_TOUCH_CST328_READ_Number_REG, buf, 1)) {
+    return false;
+  }
+
+  uint8_t touch_cnt = buf[0] & 0x0F;
+
+  if (touch_cnt == 0) {
+    Touch_I2C_Write(0, ESP_LCD_TOUCH_CST328_READ_Number_REG, &clear, 1);
+    touch_data.points = 0;
+    return false;
+  }
+
+  if (touch_cnt > CST328_LCD_TOUCH_MAX_POINTS) {
+    Touch_I2C_Write(0, ESP_LCD_TOUCH_CST328_READ_Number_REG, &clear, 1);
+    tel_touch_on_error();            
+    return false;
+  }
+
+  if (!Touch_I2C_Read(0, ESP_LCD_TOUCH_CST328_READ_XY_REG, &buf[1], 27)) {
+    return false;
+  }
+
+  Touch_I2C_Write(0, ESP_LCD_TOUCH_CST328_READ_Number_REG, &clear, 1);
+
+  touch_data.points = touch_cnt;
+
+  for (int i = 0; i < touch_cnt; i++) {
+    int num = (i > 0) ? 2 : 0;
+    touch_data.coords[i].x = (uint16_t)(((uint16_t)buf[(i * 5) + 2 + num] << 4) + ((buf[(i * 5) + 4 + num] & 0xF0) >> 4));
+    touch_data.coords[i].y = (uint16_t)(((uint16_t)buf[(i * 5) + 3 + num] << 4) + (buf[(i * 5) + 4 + num] & 0x0F));
+    touch_data.coords[i].strength = ((uint16_t)buf[(i * 5) + 5 + num]);
+  }
+
+  tel_touch_on_valid_sample();    
+  return true;
+}
+
+void mapRawToDisplay(uint16_t rawX, uint16_t rawY, uint16_t *dispX, uint16_t *dispY) {
+  uint16_t mappedX, mappedY;
+  uint16_t w = DISPLAY_WIDTH;
+  uint16_t h = DISPLAY_HEIGHT;
+
+  if (platform.touch_swap_xy) {
+    mappedX = map(rawY, platform.touch_raw_y_min, platform.touch_raw_y_max, 0, w - 1);
+    mappedY = map(rawX, platform.touch_raw_x_min, platform.touch_raw_x_max, 0, h - 1);
+  } else {
+    mappedX = map(rawX, platform.touch_raw_x_min, platform.touch_raw_x_max, 0, w - 1);
+    mappedY = map(rawY, platform.touch_raw_y_min, platform.touch_raw_y_max, 0, h - 1);
+  }
+
+  if (platform.touch_invert_x) mappedX = (w - 1) - mappedX;
+  if (platform.touch_invert_y) mappedY = (h - 1) - mappedY;
+
+  *dispX = constrain(mappedX, 0, w - 1);
+  *dispY = constrain(mappedY, 0, h - 1);
+}
+
+float calculateDistance(TouchPoint p1, TouchPoint p2) {
+  float dx = (float)p1.x - (float)p2.x;
+  float dy = (float)p1.y - (float)p2.y;
+  return sqrtf(dx * dx + dy * dy);
+}
+
+void triggerGesture(GestureType type, uint16_t x, uint16_t y, float value, uint8_t fingers) {
+  last_gesture.type         = type;
+  last_gesture.x            = x;
+  last_gesture.y            = y;
+  last_gesture.value        = value;
+  last_gesture.finger_count = fingers;
+  last_gesture.timestamp    = millis();
+}
+
+void processSimpleGestures() {
+  unsigned long now = millis();
+
+  if (last_active_count > 0 && active_touch_count == 0) {
+    if (last_active_count == 1) {
+      TouchPoint &tp = touch_points[0];
+      unsigned long duration = tp.touch_end - tp.touch_start;
+      float dx = (float)tp.x - (float)tp.start_x;
+      float dy = (float)tp.y - (float)tp.start_y;
+      float movement = sqrtf(dx * dx + dy * dy);
+
+      if (movement <= 20 && duration <= 250) {
+        if (now - last_tap_time < 400 &&
+            uabs16((int)tp.x - (int)last_tap_x) < 20 &&
+            uabs16((int)tp.y - (int)last_tap_y) < 20) {
+          triggerGesture(GestureType::DoubleTap, tp.x, tp.y, 2.0f, 1);
+          last_tap_time = 0;
+        } else {
+          triggerGesture(GestureType::Tap, tp.x, tp.y, 1.0f, 1);
+          last_tap_time = now;
+          last_tap_x = tp.x;
+          last_tap_y = tp.y;
+        }
+      } else if (movement > 30 && duration < 500) {
+        if (fabsf(dx) > fabsf(dy)) {
+          triggerGesture((dx > 0) ? GestureType::SwipeRight : GestureType::SwipeLeft,
+                         tp.x, tp.y, movement, 1);
+        } else {
+          triggerGesture((dy > 0) ? GestureType::SwipeDown : GestureType::SwipeUp,
+                         tp.x, tp.y, movement, 1);
+        }
+      }
+    } else if (last_active_count == 2) {
+      uint16_t cx = (uint16_t)((touch_points[0].x + touch_points[1].x) / 2);
+      uint16_t cy = (uint16_t)((touch_points[0].y + touch_points[1].y) / 2);
+      triggerGesture(GestureType::TwoFingerTap, cx, cy, 2.0f, 2);
+    } else if (last_active_count >= 3) {
+      uint32_t sx = 0, sy = 0;
+      for (int i = 0; i < last_active_count; i++) { sx += touch_points[i].x; sy += touch_points[i].y; }
+      uint16_t cx = (uint16_t)(sx / last_active_count);
+      uint16_t cy = (uint16_t)(sy / last_active_count);
+      triggerGesture(GestureType::ThreeFingerTap, cx, cy, (float)last_active_count, last_active_count);
+    }
+  }
+
+  if (active_touch_count == 1) {
+    TouchPoint &tp = touch_points[0];
+    unsigned long duration = now - tp.touch_start;
+    float dx = (float)tp.x - (float)tp.start_x;
+    float dy = (float)tp.y - (float)tp.start_y;
+    float movement = sqrtf(dx * dx + dy * dy);
+    if (duration > 800 && movement <= 20) {
+      static unsigned long last_long_press = 0;
+      if (now - last_long_press > 1000) {
+        triggerGesture(GestureType::LongPress, tp.x, tp.y, (float)duration, 1);
+        last_long_press = now;
+      }
+    }
+  }
+}
+
+void updateMultiTouch() {
+  unsigned long now = millis();
+  last_active_count = active_touch_count;
+
+  for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+    touch_points[i].was_active_last_frame = touch_points[i].active;
+  }
+
+  if (!Touch_Read_Data()) {
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+      if (touch_points[i].active) {
+        touch_points[i].active = false;
+        touch_points[i].touch_end = now;
+      }
+    }
+    active_touch_count  = 0;
+    current_state_text  = "IDLE";
+  } else {
+    active_touch_count = touch_data.points;
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+      if (i < touch_data.points) {
+        uint16_t rawX = touch_data.coords[i].x;
+        uint16_t rawY = touch_data.coords[i].y;
+        uint16_t dispX, dispY;
+        mapRawToDisplay(rawX, rawY, &dispX, &dispY);
+
+        if (!touch_points[i].active) {
+          touch_points[i].touch_start = now;
+          touch_points[i].start_x = dispX;
+          touch_points[i].start_y = dispY;
+        }
+
+        touch_points[i].x = dispX;
+        touch_points[i].y = dispY;
+        touch_points[i].strength = touch_data.coords[i].strength;
+        touch_points[i].active = true;
+      } else {
+        if (touch_points[i].active) {
+          touch_points[i].active = false;
+          touch_points[i].touch_end = now;
+        }
+      }
+    }
+  }
+
+  if      (active_touch_count == 0) current_state_text = "IDLE";
+  else if (active_touch_count == 1) current_state_text = "SINGLE_TOUCH";
+  else if (active_touch_count == 2) current_state_text = "DUAL_TOUCH";
+  else                              current_state_text = "MULTI_TOUCH";
+
+  if (active_touch_count > 0) {
+    PM_MARK_USER_ACTIVITY();
+  }
+
+  processSimpleGestures();
+}
+
+uint8_t Touch_Get_XY(uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *point_num, uint8_t max_point_num) {
+  if (!x || !y || !point_num || max_point_num == 0) return 0;
+
+  noInterrupts();
+  if (touch_data.points > max_point_num) touch_data.points = max_point_num;
+  for (size_t i = 0; i < touch_data.points; i++) {
+    x[i] = touch_data.coords[i].x;
+    y[i] = touch_data.coords[i].y;
+    if (strength) strength[i] = touch_data.coords[i].strength;
+  }
+  *point_num = touch_data.points;
+  touch_data.points = 0; 
+  interrupts();
+
+  return (*point_num > 0);
+}
+
+void touch_init() {
+  if (platform.touch_driver == TouchDriver::NONE) {
+      LOGI("Touch: No driver configured.");
+      touchInitialized = false;
+      return;
+  }
+
+  LOG_INIT_BEGIN("Touch");
+  pinMode(platform.pin_touch_rst, OUTPUT);
+  
+  digitalWrite(platform.pin_touch_rst, HIGH);
+  watchdog_safe_delay(50);
+  digitalWrite(platform.pin_touch_rst, LOW);
+  watchdog_safe_delay(5);
+  digitalWrite(platform.pin_touch_rst, HIGH);
+  watchdog_safe_delay(100);
+
+  for (int i = 0; i < 3; ++i) {
+      uint16_t verification = CST328_Read_Config();
+      if (verification == 0xCACA) {
+          touchInitialized = true;
+          g_i2c_err_streak = 0; // Bei Erfolg Fehlerzähler zurücksetzen
+          LOG_INIT_READY("Touch");
+          return;
+      }
+      LOGW("Touch: Verify failed (0x%04X), retry %d...", verification, i + 1);
+      watchdog_safe_delay(100);
+  }
+
+  touchInitialized = false;
+  LOG_INIT_FAIL("Touch", "Verify failed after multiple retries.");
+}

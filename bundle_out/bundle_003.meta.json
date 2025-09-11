@@ -1,0 +1,27 @@
+{
+    "bundle":  "bundle_003.txt",
+    "total_code_len":  18422,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "include\\Touch_CST328.h",
+                      "code_len":  2222
+                  },
+                  {
+                      "rel":  "include\\ui.h",
+                      "code_len":  250
+                  },
+                  {
+                      "rel":  "include\\ui_sd_manager.h",
+                      "code_len":  621
+                  },
+                  {
+                      "rel":  "src\\actions.cpp",
+                      "code_len":  2074
+                  },
+                  {
+                      "rel":  "src\\boot_header.cpp",
+                      "code_len":  13878
+                  }
+              ]
+}

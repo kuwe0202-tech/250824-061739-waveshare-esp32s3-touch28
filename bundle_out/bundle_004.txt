@@ -1,0 +1,478 @@
+﻿KANON: Projekt-Hinweise klimakontroller
+Version: 2025-09-11.2211
+Gueltig ab: 2025-09-11
+Status: Diese Version ist allein gueltig. Fruehere Versionen sind ungueltig.
+Scope: Alle Projekt-Chats "klimakontroller".
+
+Abschnitt A - Erinnerung 1: Arbeitsregeln (extrem wichtig, strikt einzuhalten)
+[Erinnere dich an die erinnerung "Arbeitsregeln"]
+Abschnitt B - Erinnerung 2: Projektziel und Funktionsumfang
+[Erinnere dich an die erinnerung "Ziele klimakontroller"]
+Abschnitt C - Erinnerung 3: Rahmenbedinungen
+[Erinnere dich an die erinnerung "Rahmenbedingungen"]
+
+
+
+/* === BEGIN FILE: src\Display_ST7789_Treiber.cpp === */
+#include "Display_ST7789_Treiber.h"
+#include "PlatformConfig.h"
+#include <Arduino.h>
+#include "Log.h"
+
+#if defined(ARDUINO_ARCH_ESP32)
+  #include <driver/ledc.h>
+  #include <driver/spi_common.h>
+#else
+  typedef int spi_host_device_t;
+  enum { SPI1_HOST = 0, SPI2_HOST = 1, SPI3_HOST = 2 };
+  #ifndef SPI_DMA_CH_AUTO
+    #define SPI_DMA_CH_AUTO 0
+  #endif
+#endif
+
+
+LGFX::LGFX(void) {
+  { 
+    auto cfg = _bus_instance.config();
+    cfg.spi_host    = (spi_host_device_t)platform.spi_host_disp;
+    cfg.spi_mode    = 0;
+    cfg.freq_write  = platform.spi_clk_disp_hz;
+    cfg.freq_read   = platform.spi_clk_disp_read_hz;
+    cfg.spi_3wire   = (platform.pin_disp_miso < 0);
+    cfg.use_lock    = true;
+    cfg.dma_channel = SPI_DMA_CH_AUTO;
+    cfg.pin_sclk    = platform.pin_disp_sclk;
+    cfg.pin_mosi    = platform.pin_disp_mosi;
+    cfg.pin_miso    = platform.pin_disp_miso;
+    cfg.pin_dc      = platform.pin_disp_dc;
+    _bus_instance.config(cfg);
+    _panel_instance.setBus(&_bus_instance);
+  }
+  { 
+    auto cfg = _panel_instance.config();
+    cfg.pin_cs           = platform.pin_disp_cs;
+    cfg.pin_rst          = platform.pin_disp_rst;
+    cfg.pin_busy         = -1;
+    
+    cfg.memory_width     = 240;
+    cfg.memory_height    = 320;
+    cfg.panel_width      = 240;
+    cfg.panel_height     = 320;
+
+    cfg.offset_x         = 0;
+    cfg.offset_y         = 0;
+    cfg.offset_rotation  = 0;
+
+    cfg.dummy_read_pixel = 8;
+    cfg.dummy_read_bits  = 1;
+
+    cfg.readable         = (platform.pin_disp_miso >= 0);
+    cfg.invert           = true;
+    cfg.rgb_order        = true;
+    cfg.dlen_16bit       = false;
+    cfg.bus_shared       = true;
+    _panel_instance.config(cfg);
+  }
+  setPanel(&_panel_instance);
+}
+
+LGFX tft;
+
+static bool s_tft_ready = false;
+static uint8_t s_bl_percent = Config::DISP_BACKLIGHT_INIT_PCT; 
+
+#if defined(ARDUINO_ARCH_ESP32)
+static inline void bl_write_raw(uint32_t raw) {
+  const uint32_t max_raw = (1u << Config::BL_PWM_RES_BITS) - 1u;
+  if (raw > max_raw) raw = max_raw;
+  ledc_set_duty(Config::BL_PWM_MODE, Config::BL_PWM_CHANNEL, raw);
+  ledc_update_duty(Config::BL_PWM_MODE, Config::BL_PWM_CHANNEL);
+}
+#else
+static inline void bl_write_raw(uint32_t raw) {
+  pinMode(platform.pin_disp_bl, OUTPUT);
+  uint8_t v = (raw > 255u) ? 255u : (uint8_t)raw;
+  analogWrite(platform.pin_disp_bl, v);
+}
+#endif
+
+void tft_init() {
+  if (s_tft_ready) return;
+  LOG_INIT_BEGIN("TFT");
+  const bool ok = tft.init();
+  if (ok) {
+    tft.setRotation(platform.display_rotation);
+    tft.fillScreen(TFT_BLACK);
+    LOG_INIT_READY("TFT");
+    s_tft_ready = true;
+  } else {
+    LOG_INIT_FAIL("TFT", "init() failed");
+    s_tft_ready = false;
+  }
+}
+
+bool tft_is_ready() { return s_tft_ready; }
+
+#if defined(ARDUINO_ARCH_ESP32)
+void backlight_init() {
+  LOG_INIT_BEGIN("Backlight");
+  pinMode(platform.pin_disp_bl, OUTPUT);
+
+  ledc_timer_config_t tcfg{};
+  tcfg.speed_mode      = Config::BL_PWM_MODE;
+  tcfg.timer_num       = Config::BL_PWM_TIMER;
+  tcfg.duty_resolution = (ledc_timer_bit_t)Config::BL_PWM_RES_BITS;
+  tcfg.freq_hz         = Config::BL_PWM_FREQ_HZ;
+  tcfg.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&tcfg);
+
+  ledc_channel_config_t ccfg{};
+  ccfg.gpio_num   = platform.pin_disp_bl;
+  ccfg.speed_mode = Config::BL_PWM_MODE;
+  ccfg.channel    = Config::BL_PWM_CHANNEL;
+  ccfg.intr_type  = LEDC_INTR_DISABLE;
+  ccfg.timer_sel  = Config::BL_PWM_TIMER;
+  ccfg.duty       = 0;
+  ccfg.hpoint     = 0;
+  ledc_channel_config(&ccfg);
+
+  set_backlight_percent(s_bl_percent);
+  LOG_INIT_READY("Backlight");
+}
+#else  
+void backlight_init() {
+  LOG_INIT_BEGIN("Backlight");
+  set_backlight_percent(s_bl_percent);
+  LOG_INIT_READY("Backlight");
+}
+#endif
+
+void set_backlight_percent(uint8_t pct) {
+  if (pct > 100) pct = 100;
+  s_bl_percent = pct;
+#if defined(ARDUINO_ARCH_ESP32)
+  const uint32_t maxd = (uint32_t)Config::DISP_BACKLIGHT_MAX;
+  const uint32_t duty = (pct * maxd + 50) / 100;
+  bl_write_raw(duty);
+#else
+  const uint32_t duty = (pct * (uint32_t)Config::DISP_BACKLIGHT_MAX + 50) / 100;
+  bl_write_raw(duty);
+#endif
+}
+
+static constexpr uint8_t CMD_SLPIN   = 0x10;
+static constexpr uint8_t CMD_SLPOUT  = 0x11;
+static constexpr uint8_t CMD_DISPOFF = 0x28;
+static constexpr uint8_t CMD_DISPON  = 0x29;
+
+void display_sleep() {
+  tft.startWrite(); tft.writeCommand(CMD_DISPOFF); tft.endWrite();
+  delay(5);
+  tft.startWrite(); tft.writeCommand(CMD_SLPIN);   tft.endWrite();
+  delay(120);
+  set_backlight_percent(0);
+}
+
+void display_wake() {
+  tft.startWrite(); tft.writeCommand(CMD_SLPOUT);  tft.endWrite();
+  delay(120);
+  tft.startWrite(); tft.writeCommand(CMD_DISPON);  tft.endWrite();
+  set_backlight_percent(s_bl_percent);  
+}
+/* === END FILE: src\Display_ST7789_Treiber.cpp === */
+/* === BEGIN FILE: src\fs_policy.cpp === */
+#include "fs_policy.h"
+#include "fs_paths.h"
+#include "Log.h"
+
+#include <set>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <algorithm>
+#include <cstring>
+#include <cctype>
+#include <cassert>
+
+#include "ff.h"
+
+#ifndef FF_MAX_LFN
+#define FF_MAX_LFN 255
+#warning "FF_MAX_LFN not defined, using fallback value 255. Please include ffconf.h in your build path."
+#endif
+
+
+
+
+static FS* s_fs = nullptr;
+static FsPolicyTelemetry s_telemetry = {0};
+
+
+
+
+LfnTempScope::LfnTempScope() {}
+LfnTempScope::~LfnTempScope() {
+    std::lock_guard<std::mutex> lock(mtx);
+    const uint32_t leaks = (uint32_t)paths.size();
+    if (leaks > 0) {
+        s_telemetry.lfn_temp_leaks_total += leaks;
+        if (s_telemetry.lfn_temp_in_use >= leaks) {
+            s_telemetry.lfn_temp_in_use -= leaks;
+        } else {
+            s_telemetry.lfn_temp_in_use = 0;
+        }
+        paths.clear();
+    }
+}
+
+void LfnTempScope::register_path(const char* p) {
+    if (!p || !*p) return;
+    std::lock_guard<std::mutex> lock(mtx);
+    paths.emplace_back(p);
+    s_telemetry.lfn_temp_in_use += 1;
+}
+
+void LfnTempScope::unregister_path(const char* p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = std::find(paths.begin(), paths.end(), std::string(p));
+    if (it != paths.end()) {
+        paths.erase(it);
+        if (s_telemetry.lfn_temp_in_use > 0) s_telemetry.lfn_temp_in_use -= 1;
+    }
+}
+
+
+
+
+static void record_policy_violation(FsPolicyError err, const char* path) {
+    s_telemetry.policy_violations_total++;
+    s_telemetry.last_error = err;
+    if (!path) {
+        s_telemetry.last_error_path[0] = '\0';
+        return;
+    }
+    strncpy(s_telemetry.last_error_path, path, sizeof(s_telemetry.last_error_path) - 1);
+    s_telemetry.last_error_path[sizeof(s_telemetry.last_error_path) - 1] = '\0';
+}
+
+void fs_fsync(File& file) {
+    if (file) file.flush();
+}
+
+bool fs_same_dir(const char* path_a, const char* path_b) {
+    if (!path_a || !path_b) return false;
+    const char* last_slash_a = strrchr(path_a, '/');
+    const char* last_slash_b = strrchr(path_b, '/');
+    size_t dir_len_a = (last_slash_a > path_a) ? (size_t)(last_slash_a - path_a) : 0;
+    size_t dir_len_b = (last_slash_b > path_b) ? (size_t)(last_slash_b - path_b) : 0;
+    if (dir_len_a != dir_len_b) return false;
+    if (dir_len_a == 0) return true;
+    return memcmp(path_a, path_b, dir_len_a) == 0;
+}
+
+bool fs_policy_is_final_path(const char* path) {
+    static const std::set<std::string> DOS_RESERVED_NAMES = {
+        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    };
+    if (!path || path[0] != '/' || strcmp(path, "/") == 0) return false;
+
+    
+    
+    const char* basename_ptr = strrchr(path, '/');
+    if (basename_ptr && strcmp(basename_ptr + 1, FsSpecial::DIRBAR_BASENAME) == 0) {
+        return true;
+    }
+    
+
+    for (const char* p = path; *p; ++p) {
+        unsigned char uc = (unsigned char)*p;
+        if (!(std::isalpha(uc) || std::isdigit(uc) || uc == '_' || uc == '/' || uc == '.')) return false;
+    }
+
+    char path_buf[FF_MAX_LFN + 1];
+    strncpy(path_buf, path, sizeof(path_buf));
+    path_buf[sizeof(path_buf) - 1] = '\0';
+
+    char* saveptr = nullptr;
+    char* root = strtok_r(path_buf + 1, "/", &saveptr);
+    if (!root) return false;
+
+    char root_path[32];
+    snprintf(root_path, sizeof(root_path), "/%s", root);
+    for (char* p = root_path; *p; ++p) *p = (char)std::tolower((unsigned char)*p);
+
+    const bool root_ok =
+        (strcmp(root_path, FsFinalPath::LOGS)    == 0) ||
+        (strcmp(root_path, FsFinalPath::DUMP)    == 0) ||
+        (strcmp(root_path, FsFinalPath::CONFIG)  == 0) ||
+        (strcmp(root_path, FsFinalPath::UPDATE)  == 0) ||
+        (strcmp(root_path, FsFinalPath::SERVICE) == 0) ||
+        (strcmp(root_path, FsFinalPath::Legacy::LOGS)   == 0) ||
+        (strcmp(root_path, FsFinalPath::Legacy::DUMP)   == 0) ||
+        (strcmp(root_path, FsFinalPath::Legacy::CONFIG) == 0);
+
+    if (!root_ok) return false;
+
+    char* filename = strtok_r(nullptr, "/", &saveptr);
+    if (!filename) return true;
+    if (strtok_r(nullptr, "/", &saveptr)) return false;
+
+    char* dot = strchr(filename, '.');
+    if (!dot || dot == filename || strchr(dot + 1, '.') || strlen(dot + 1) != 3) return false;
+
+    *dot = '\0';
+    char* basename = filename;
+    size_t base_len = strlen(basename);
+    if (base_len < 1 || base_len > 8) return false;
+
+    for (size_t i = 0; i < base_len; ++i) {
+        unsigned char uc = (unsigned char)basename[i];
+        if (!(std::isalnum(uc) || basename[i] == '_')) return false;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        unsigned char uc = (unsigned char)*(dot + 1 + i);
+        if (!(std::isalnum(uc) || uc == '_')) return false;
+    }
+
+    char basename_up[9] = {0};
+    for (size_t i = 0; i < base_len && i < sizeof(basename_up) - 1; ++i)
+        basename_up[i] = (char)std::toupper((unsigned char)basename[i]);
+    if (DOS_RESERVED_NAMES.count(basename_up)) return false;
+
+    return true;
+}
+
+
+
+
+void fs_policy_init(FS& fs) {
+    s_fs = &fs;
+}
+
+File fs_open_final(const char* path, const char* mode) {
+    if (!fs_policy_is_final_path(path)) {
+        record_policy_violation(FsPolicyError::ERR_PATH_NOT_8DOT3_FINAL, path);
+        LOGE("Policy VIOLATION: Attempt to open invalid final path '%s'", path ? path : "(null)");
+        return File();
+    }
+    return s_fs ? s_fs->open(path, mode) : File();
+}
+
+File fs_open_temp(LfnTempScope& scope, const char* path, const char* mode) {
+    scope.register_path(path);
+    return s_fs ? s_fs->open(path, mode) : File();
+}
+
+bool fs_policy_mkdir(const char* dir_path) {
+    return s_fs ? s_fs->mkdir(dir_path) : false;
+}
+
+bool fs_policy_remove(const char* path) {
+    return s_fs ? s_fs->remove(path) : false;
+}
+
+static void touch_dirbar_for_target(const char* final_path) {
+    if (!s_fs || !final_path) return;
+    const char* last_slash = strrchr(final_path, '/');
+    if (!last_slash || last_slash == final_path) return;
+
+    size_t dir_len = (size_t)(last_slash - final_path);
+    char dirbar_path[FF_MAX_LFN + 1] = {0};
+    if (dir_len + 1 + strlen(FsSpecial::DIRBAR_BASENAME) >= sizeof(dirbar_path)) return;
+
+    memcpy(dirbar_path, final_path, dir_len);
+    dirbar_path[dir_len] = '\0';
+    strcat(dirbar_path, "/");
+    strcat(dirbar_path, FsSpecial::DIRBAR_BASENAME);
+
+    File f = s_fs->open(dirbar_path, s_fs->exists(dirbar_path) ? "a" : "w");
+    if (f) { (void)f.write((const uint8_t*)"", 0); fs_fsync(f); f.close(); }
+}
+
+FsPolicyError fs_policy_commit_copy(LfnTempScope& scope, const char* src_temp_path, const char* dst_final_path) {
+    if (fs_policy_is_final_path(src_temp_path) || !fs_policy_is_final_path(dst_final_path)) {
+        record_policy_violation(FsPolicyError::ERR_PATH_NOT_8DOT3_FINAL, src_temp_path);
+        return FsPolicyError::ERR_PATH_NOT_8DOT3_FINAL;
+    }
+    if (!fs_same_dir(src_temp_path, dst_final_path)) {
+        record_policy_violation(FsPolicyError::ERR_RENAME_CROSS_DIR, src_temp_path);
+        return FsPolicyError::ERR_RENAME_CROSS_DIR;
+    }
+    if (!s_fs) return FsPolicyError::ERR_FATFS_API_ERROR;
+
+    File src = s_fs->open(src_temp_path, "r");
+    if (!src) return FsPolicyError::ERR_FATFS_API_ERROR;
+    File dst = fs_open_final(dst_final_path, "w");
+    if (!dst) { src.close(); return FsPolicyError::ERR_FATFS_API_ERROR; }
+
+    size_t src_size = src.size();
+    uint8_t buf[4096];
+    for (;;) {
+        size_t n = src.read(buf, sizeof(buf));
+        if (n == 0) break;
+        if (dst.write(buf, n) != n) {
+            src.close(); dst.close(); s_fs->remove(dst_final_path);
+            return FsPolicyError::ERR_FATFS_API_ERROR;
+        }
+    }
+    fs_fsync(dst);
+    dst.close();
+
+    File dst_verify = s_fs->open(dst_final_path, "r");
+    bool verified = (dst_verify && dst_verify.size() == src_size);
+    if (dst_verify) dst_verify.close();
+    if (!verified) {
+        src.close(); s_fs->remove(dst_final_path);
+        return FsPolicyError::ERR_COMMIT_VERIFY_FAIL;
+    }
+
+    scope.unregister_path(src_temp_path);
+    src.close();
+    s_fs->remove(src_temp_path);
+    touch_dirbar_for_target(dst_final_path);
+    s_telemetry.commit_copy_used++;
+    return FsPolicyError::OK;
+}
+
+bool fs_policy_rename(LfnTempScope& scope, const char* from_temp_path, const char* to_final_path) {
+    if (fs_policy_is_final_path(from_temp_path) || !fs_policy_is_final_path(to_final_path)) {
+        record_policy_violation(FsPolicyError::ERR_PATH_NOT_8DOT3_FINAL, from_temp_path);
+        return false;
+    }
+    if (!fs_same_dir(from_temp_path, to_final_path)) {
+        record_policy_violation(FsPolicyError::ERR_RENAME_CROSS_DIR, from_temp_path);
+        return false;
+    }
+    if (!s_fs) return false;
+
+    if (s_fs->rename(from_temp_path, to_final_path)) {
+        scope.unregister_path(from_temp_path);
+        touch_dirbar_for_target(to_final_path);
+        s_telemetry.commit_rename_used++;
+        return true;
+    }
+    return false;
+}
+
+bool fs_policy_rename_dir(const char* from_path, const char* to_path) {
+    if (!s_fs) return false;
+    if (s_fs->exists(from_path)) {
+        LOGI("Migrating '%s' -> '%s'", from_path, to_path);
+        return s_fs->rename(from_path, to_path);
+    }
+    return true;
+}
+
+void fs_policy_get_telemetry(FsPolicyTelemetry& stats) {
+    stats = s_telemetry;
+}
+/* === END FILE: src\fs_policy.cpp === */
+/* === BEGIN FILE: src\images.cpp === */
+#include "images.h"
+
+const ext_img_desc_t images[1] = {
+    0
+};
+/* === END FILE: src\images.cpp === */

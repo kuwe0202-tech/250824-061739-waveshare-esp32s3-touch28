@@ -1,0 +1,51 @@
+{
+    "bundle":  "bundle_001.txt",
+    "total_code_len":  19385,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "include\\actions.h",
+                      "code_len":  317
+                  },
+                  {
+                      "rel":  "include\\boot_header.h",
+                      "code_len":  2079
+                  },
+                  {
+                      "rel":  "include\\Display_ST7789_Treiber.h",
+                      "code_len":  375
+                  },
+                  {
+                      "rel":  "include\\fonts.h",
+                      "code_len":  164
+                  },
+                  {
+                      "rel":  "include\\fs_paths.h",
+                      "code_len":  1555
+                  },
+                  {
+                      "rel":  "include\\fs_policy.h",
+                      "code_len":  1613
+                  },
+                  {
+                      "rel":  "include\\images.h",
+                      "code_len":  376
+                  },
+                  {
+                      "rel":  "include\\Konfiguration.h",
+                      "code_len":  4620
+                  },
+                  {
+                      "rel":  "include\\Log.h",
+                      "code_len":  3567
+                  },
+                  {
+                      "rel":  "include\\lvgl_mem_custom.h",
+                      "code_len":  3537
+                  },
+                  {
+                      "rel":  "include\\LVGL_Treiber.h",
+                      "code_len":  1684
+                  }
+              ]
+}

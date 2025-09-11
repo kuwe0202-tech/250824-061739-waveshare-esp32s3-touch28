@@ -1,0 +1,11 @@
+{
+    "bundle":  "bundle_017.txt",
+    "total_code_len":  9512,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\ui_sd_manager.cpp",
+                      "code_len":  9791
+                  }
+              ]
+}

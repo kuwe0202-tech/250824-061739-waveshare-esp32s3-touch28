@@ -1,0 +1,725 @@
+﻿KANON: Projekt-Hinweise klimakontroller
+Version: 2025-09-11.2211
+Gueltig ab: 2025-09-11
+Status: Diese Version ist allein gueltig. Fruehere Versionen sind ungueltig.
+Scope: Alle Projekt-Chats "klimakontroller".
+
+Abschnitt A - Erinnerung 1: Arbeitsregeln (extrem wichtig, strikt einzuhalten)
+[Erinnere dich an die erinnerung "Arbeitsregeln"]
+Abschnitt B - Erinnerung 2: Projektziel und Funktionsumfang
+[Erinnere dich an die erinnerung "Ziele klimakontroller"]
+Abschnitt C - Erinnerung 3: Rahmenbedinungen
+[Erinnere dich an die erinnerung "Rahmenbedingungen"]
+
+
+
+/* === BEGIN FILE: include\PlatformConfig.h === */
+#pragma once
+#ifndef PLATFORM_CONFIG_H
+#define PLATFORM_CONFIG_H
+
+#include <cstdint>
+
+
+enum class DisplayDriver { ST7789, ILI9341, HDMI };
+enum class TouchDriver   { CST328, FT5x06, NONE };
+enum class SdMode        { SDMMC, SDSPI };
+enum class BusWidth      { BW1 = 1, BW4 = 4 };
+
+struct PlatformConfig {
+  
+  DisplayDriver display_driver;
+  uint16_t      display_width;
+  uint16_t      display_height;
+  uint16_t      display_rotation;
+  int           pin_disp_sclk;
+  int           pin_disp_mosi;
+  int           pin_disp_miso;
+  int           pin_disp_cs;
+  int           pin_disp_dc;
+  int           pin_disp_rst;
+  int           pin_disp_bl;
+  int           spi_host_disp;
+  uint32_t      spi_clk_disp_hz;
+  uint32_t      spi_clk_disp_read_hz;
+
+  
+  TouchDriver   touch_driver;
+  bool          touch_swap_xy;
+  bool          touch_invert_x;
+  bool          touch_invert_y;
+  uint16_t      touch_raw_x_min;
+  uint16_t      touch_raw_x_max;
+  uint16_t      touch_raw_y_min;
+  uint16_t      touch_raw_y_max;
+  int           i2c_port_touch;
+  int           pin_touch_sda;
+  int           pin_touch_scl;
+  int           pin_touch_irq;
+  int           pin_touch_rst;
+  uint8_t       i2c_addr_touch;
+
+  
+  SdMode        sd_mode;
+  BusWidth      sd_bus;
+  uint32_t      sd_clk_hz;
+  
+  int           pin_sd_clk;
+  int           pin_sd_cmd;
+  int           pin_sd_d0;
+  int           pin_sd_d1;
+  int           pin_sd_d2;
+  int           pin_sd_d3;
+  int           pin_sd_cd;
+  
+  int           spi_host_sd;
+  int           pin_sd_cs;
+  int           pin_sd_mosi;
+  int           pin_sd_miso;
+  int           pin_sd_sclk;
+
+  
+  int           i2c_port_rtc;
+  int           pin_rtc_sda;
+  int           pin_rtc_scl;
+  uint8_t       i2c_addr_rtc;
+  
+  
+  bool          has_psram;
+  uint32_t      wdt_ui_ms;
+  uint32_t      wdt_io_ms;
+};
+
+
+extern PlatformConfig platform;
+
+
+PlatformConfig probe_platform();
+
+#endif 
+/* === END FILE: include\PlatformConfig.h === */
+/* === BEGIN FILE: include\RTC_PCF85063.h === */
+
+
+#ifndef RTC_PCF85063_H
+#define RTC_PCF85063_H
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "Konfiguration.h"
+#include <lvgl.h>
+
+constexpr uint8_t RTC_CTRL_1_ADDR     = 0x00;
+constexpr uint8_t RTC_CTRL_2_ADDR     = 0x01;
+constexpr uint8_t RTC_SECOND_ADDR     = 0x04;
+constexpr uint8_t RTC_DAY_ADDR        = 0x07;
+constexpr uint8_t RTC_MONTH_ADDR      = 0x09;
+constexpr uint8_t RTC_YEAR_ADDR       = 0x0A;
+constexpr uint8_t RTC_SECOND_ALARM    = 0x0B;
+
+constexpr uint8_t RTC_CTRL_1_STOP     = 0x20;
+constexpr uint8_t RTC_CTRL_1_SR       = 0x10;
+constexpr uint8_t RTC_CTRL_1_CAP_SEL  = 0x01;
+constexpr uint8_t RTC_CTRL_2_AIE      = 0x80;
+constexpr uint8_t RTC_CTRL_2_AF       = 0x40;
+constexpr uint8_t RTC_ALARM           = 0x80;
+
+constexpr uint8_t RTC_CTRL_1_DEFAULT  = 0x00;
+constexpr uint8_t RTC_CTRL_2_DEFAULT  = 0x00;
+
+typedef struct {
+  uint16_t year;
+  uint8_t  month;
+  uint8_t  day;
+  uint8_t  dotw;
+  uint8_t  hour;
+  uint8_t  minute;
+  uint8_t  second;
+} datetime_t;
+
+typedef void (*rtc_update_hook_t)(const datetime_t* now);
+
+typedef void (*rtc_valid_callback_t)(void);
+
+extern datetime_t rtc_datetime;
+
+static inline bool rtc_has_valid_time() { return rtc_datetime.year >= 1970; }
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void     rtc_notify_time_set(uint64_t new_wallclock_us);
+bool     rtc_is_valid(void);
+
+bool rtc_make_iso_timestamp(char* buf, size_t buflen);
+
+
+bool rtc_get_wall_boot_offset_us(int64_t* offset);
+
+#ifdef __cplusplus
+}
+#endif
+
+void rtc_pcf85063_init();
+void RTC_PCF85063_Loop();
+
+
+uint64_t rtc_get_unix_us_now(void);
+void rtc_set_valid_callback(rtc_valid_callback_t cb);
+
+void rtc_sync_system_time_from_hw(void);
+
+void RTC_PCF85063_Set_Time(const datetime_t &time);
+void RTC_PCF85063_Set_Date(const datetime_t &date);
+void RTC_PCF85063_Set_All(const datetime_t &time);
+
+void RTC_PCF85063_Read_Time(datetime_t *time);
+
+void rtc_set_update_hook(rtc_update_hook_t cb);
+
+void RTC_PCF85063_Enable_Alarm();
+uint8_t RTC_PCF85063_Get_Alarm_Flag();
+void RTC_PCF85063_Set_Alarm(const datetime_t &time);
+void RTC_PCF85063_Read_Alarm(datetime_t *time);
+
+void rtc_uhr_label_setzen(lv_obj_t *label);
+void rtc_uhr_aktualisieren();
+void RTC_PCF85063_SetupUhr (lv_obj_t *uhr_label);
+
+void rtc_datum_label_setzen(lv_obj_t *label);
+void rtc_datum_aktualisieren();
+void RTC_PCF85063_SetupDatum(lv_obj_t *datum_label);
+
+void rtc_wochentag_label_setzen(lv_obj_t *label);
+void rtc_wochentag_aktualisieren();
+void RTC_PCF85063_SetupWochentag(lv_obj_t *wochentag_label);
+
+void rtc_apply_from_ui_rollers();
+
+#endif
+
+
+/* === END FILE: include\RTC_PCF85063.h === */
+/* === BEGIN FILE: include\runtime_globals.h === */
+
+
+#pragma once
+#include <atomic>
+
+
+
+extern std::atomic<bool> g_boot_phase_active;
+/* === END FILE: include\runtime_globals.h === */
+/* === BEGIN FILE: include\runtime_tasks.h === */
+
+#pragma once
+#include <stdint.h>
+#include <Arduino.h>
+#include "lvgl.h"
+#include "Konfiguration.h"
+
+
+struct boot_header_t;
+
+struct RuntimeTasksStatus {
+  bool          sys_scheduled;
+  bool          pm_scheduled;
+  uint32_t      sys_ticks;
+  uint32_t      pm_ticks;
+  unsigned long started_ms;
+};
+
+
+
+#if CFG_BOOT_FSM
+typedef enum {
+    FSM_GATE_CORE,
+    FSM_GATE_UI_STUB,
+    FSM_GATE_RTC,
+    FSM_GATE_TOUCH,
+    FSM_GATE_SD,
+    FSM_GATE_LOG,
+    FSM_GATE_SELFTEST
+} fsm_gate_t;
+
+void fsm_init_gates();
+void fsm_set_gate_flag(fsm_gate_t gate, bool value);
+bool fsm_get_gate_flag(fsm_gate_t gate);
+bool fsm_all_gates_ok();
+void fsm_set_uart_only_mode(const char* reason);
+bool fsm_is_uart_only_mode();
+#endif
+
+
+void runtime_tasks_init();
+bool runtime_tasks_ok();
+RuntimeTasksStatus runtime_tasks_status();
+
+void start_system_status_task(uint32_t period_ms);
+void stop_system_status_task();
+void start_power_manager_task(uint32_t period_ms);
+void stop_power_manager_task();
+void pm_mark_user_activity();
+
+void watchdog_init(void);
+void watchdog_feed(void);
+void watchdog_safe_delay(uint32_t ms);
+
+extern volatile unsigned long touch_deadzone_until;
+extern volatile unsigned long touch_block_until;
+
+
+void start_touch_poll_task(uint32_t period_ms);
+void stop_touch_poll_task();
+
+
+void tel_render_on_flush(uint32_t ms, uint32_t px, bool full_flush);
+void tel_touch_on_error();              
+void tel_i2c_on_retry();                
+void tel_touch_on_valid_sample();        
+void tel_rtc_mark_synced();             
+void tel_watchdog_set_timeout_ms(uint32_t timeout_ms);
+void tel_watchdog_mark_alive();         
+
+
+void telemetry_get_render(uint32_t* ms_avg,
+                          uint32_t* ms_max,
+                          uint32_t* px_avg,
+                          uint8_t*  fill_pct,
+                          uint32_t* full_flush_cnt);
+void telemetry_get_lvgl_heap(uint32_t* lv_used_k,
+                             uint8_t* lv_frag_pct);  
+void telemetry_get_sys_heap(uint32_t* free_k,
+                            uint32_t* min_free_k,
+                            uint32_t* largest_k);     
+void telemetry_get_scheduler(uint16_t* tick_budget_ms,
+                             uint16_t* loop_ms_last,
+                             uint32_t* overruns_cnt,
+                             uint32_t* active_tasks,
+                             uint32_t* free_slots,
+                             uint32_t* total_drops);
+void telemetry_get_touch_i2c(uint32_t* touch_err,
+                             uint32_t* i2c_retry,
+                             uint32_t* touch_stale_ms);
+void telemetry_get_rtc(bool* rtc_ok,
+                       uint32_t* rtc_age_s);
+
+
+
+
+bool     telemetry_sd_ok();
+
+
+uint32_t telemetry_fs_free_mb();
+
+
+uint32_t telemetry_fs_total_mb();
+
+
+bool     telemetry_sd_is_stale();
+
+
+void telemetry_sd_io_stats_reset(uint32_t* out_ops, uint64_t* out_bytes);
+
+
+
+int32_t  telemetry_wdt_margin_ms();     
+uint8_t  telemetry_backlight_pct();     
+uint8_t  telemetry_sleep_flag();        
+int16_t  telemetry_rssi_dbm();          
+bool     telemetry_mqtt_ok();           
+uint16_t telemetry_ping_ms();         
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void telemetry_boot_fields(const struct boot_header_t* h);
+void telemetry_event(const char* name, const char* detail);
+#ifdef __cplusplus
+}
+#endif
+
+/* === END FILE: include\runtime_tasks.h === */
+/* === BEGIN FILE: include\screens.h === */
+
+#ifndef EEZ_LVGL_UI_SCREENS_H
+#define EEZ_LVGL_UI_SCREENS_H
+
+#include <lvgl.h>
+#include "Konfiguration.h" 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct _objects_t {
+    lv_obj_t *page_startbildschirm;
+    lv_obj_t *page_desktop;
+    lv_obj_t *page_hauptmen_;
+    lv_obj_t *page_submenu_licht;
+    lv_obj_t *page_submenu_luft;
+    lv_obj_t *page_submenu_boden;
+    lv_obj_t *page_submenu_co2;
+    lv_obj_t *page_submenu_wlan;
+    lv_obj_t *page_einstellungen;
+    lv_obj_t *page_datum_einstellen;
+    lv_obj_t *page_uhrzeit_einstellen;
+    lv_obj_t *page_sd_karte_anzeigen;
+    lv_obj_t *subbutton_licht;
+    lv_obj_t *subbutton_luft;
+    lv_obj_t *subbutton_boden;
+    lv_obj_t *subbutton_wlan;
+    lv_obj_t *subbutton_einstellungen;
+    lv_obj_t *subbutton_zurueck_hauptmenu;
+    lv_obj_t *button_zurueck_lichtmenu;
+    lv_obj_t *button_zurueck_luftmenu;
+    lv_obj_t *button_zurueck_bodenmenu;
+    lv_obj_t *button_zurueck_co2menu;
+    lv_obj_t *subbutton_zurueck_4;
+    lv_obj_t *button_zurueck_einstellungenmenu;
+    lv_obj_t *uhrzeit_und_datum_einstellen;
+    lv_obj_t *button_sd_karte_anzeigen;
+    lv_obj_t *button_zurueck_subsubmenu_uhrzeit_und_datum_einstellen;
+    lv_obj_t *button_speichern_subsubmenu_uhrzeit_und_datum_einstellen;
+    lv_obj_t *button_zurueck_uhrzeit_einstellen;
+    lv_obj_t *button_speichern_subsubmenu_uhrzeit_und_datum_einstellen_1;
+    lv_obj_t *button_zurueck_einstellungenmenu_1;
+    
+    
+    lv_obj_t *boot_bar;
+    lv_obj_t *boot_label_percent;
+    lv_obj_t *boot_label_status;
+    lv_obj_t *text_uhrzeit;
+    lv_obj_t *text_datum;
+    lv_obj_t *text_relative_luftfeuchte_innen;
+    lv_obj_t *text_status_wlan;
+    lv_obj_t *text_realative_luftfeuchte_zuluft;
+    lv_obj_t *text_temperatur_innen;
+    lv_obj_t *text_temperatur_zuluft;
+    lv_obj_t *trennlinie_unter_der_zeit;
+    lv_obj_t *text_lichtstaerke_in_ppfd;
+    lv_obj_t *text_luefterleistung_in_m3;
+    lv_obj_t *anzeigebalken_licht_dimmung;
+    lv_obj_t *anzeigebalken_luefter_dimmung;
+    lv_obj_t *anzeigebalken_erdfeuchte;
+    lv_obj_t *text_erdefeucht_in_prozent;
+    lv_obj_t *text_wochentag;
+    lv_obj_t *text_sd_aktiv;
+    lv_obj_t *text_subbutton_licht;
+    lv_obj_t *text_subbutton_luft;
+    lv_obj_t *text_subbutton_boden;
+    lv_obj_t *text_subbutton_wlan;
+    lv_obj_t *text_subbutton_einstellungen;
+    lv_obj_t *text_subbutton_zuruck;
+    lv_obj_t *text_page_submenu_licht;
+    lv_obj_t *text_button_zurueck_lichtmenu;
+    lv_obj_t *text_page_submenu_luft;
+    lv_obj_t *text_button_zurueck_lufttmenu;
+    lv_obj_t *text_page_submenu_boden;
+    lv_obj_t *text_button_zurueck_bodenmenu;
+    lv_obj_t *text_page_submenu_co2;
+    lv_obj_t *text_button_zurueck_co2menu;
+    lv_obj_t *text_page_submenu_wlan;
+    lv_obj_t *text_button_zurueck_wlanmenu;
+    lv_obj_t *text_button_zurueck_einstellungenmenu;
+    lv_obj_t *text_uhrzeit_und_datum_einstellen;
+    lv_obj_t *text_sd_karte_anzeigen;
+    lv_obj_t *text_button_zurueck_subsubmenu_uhrzeit_und_datum_einstellen;
+    lv_obj_t *text_button_speichern_subsubmenu_uhrzeit_und_datum_einstellen;
+    lv_obj_t *roller_einstellungen_tag;
+    lv_obj_t *text_roller_einstellungen_tag;
+    lv_obj_t *text_roller_einstellungen_monat;
+    lv_obj_t *roller_einstellungen_monat;
+    lv_obj_t *roller_einstellungen_jahr;
+    lv_obj_t *text_roller_einstellungen_jahr;
+    lv_obj_t *text_button_zurueck_subsubmenu_uhrzeit_und_datum_einstellen_1;
+    lv_obj_t *roller_einstellungen_stunden;
+    lv_obj_t *roller_einstellungen_minuten;
+    lv_obj_t *text_roller_einstellungen_stunde;
+    lv_obj_t *text_roller_einstellungen_minuten;
+    lv_obj_t *text_button_speichern_subsubmenu_uhrzeit_und_datum_einstellen_1;
+    lv_obj_t *text_sd_karte_erkannt_nicht_erkannt;
+    lv_obj_t *text_freier_speicher;
+    lv_obj_t *text_belegter_speicher;
+    lv_obj_t *text_letzter_log;
+    
+    lv_obj_t *button_export_txt;
+    lv_obj_t *label_export_status;
+} objects_t;
+
+
+extern objects_t objects;
+
+enum ScreensEnum {
+    SCREEN_ID_PAGE_STARTBILDSCHIRM = 1,
+    SCREEN_ID_PAGE_DESKTOP = 2,
+    SCREEN_ID_PAGE_HAUPTMEN_ = 3,
+    SCREEN_ID_PAGE_SUBMENU_LICHT = 4,
+    SCREEN_ID_PAGE_SUBMENU_LUFT = 5,
+    SCREEN_ID_PAGE_SUBMENU_BODEN = 6,
+    SCREEN_ID_PAGE_SUBMENU_CO2 = 7,
+    SCREEN_ID_PAGE_SUBMENU_WLAN = 8,
+    SCREEN_ID_PAGE_EINSTELLUNGEN = 9,
+    SCREEN_ID_PAGE_DATUM_EINSTELLEN = 10,
+    SCREEN_ID_PAGE_UHRZEIT_EINSTELLEN = 11,
+    SCREEN_ID_PAGE_SD_KARTE_ANZEIGEN = 12,
+};
+
+void create_screens();
+void tick_screen(int screen_index);
+
+
+#if CFG_BOOT_FSM
+void ui_boot_screen_update_progress(int percent, const char* status_text);
+#endif
+
+
+void create_screen_page_startbildschirm();
+void tick_screen_page_startbildschirm();
+void create_screen_page_desktop();
+void tick_screen_page_desktop();
+void create_screen_page_hauptmen_();
+void tick_screen_page_hauptmen_();
+void create_screen_page_submenu_licht();
+void tick_screen_page_submenu_licht();
+void create_screen_page_submenu_luft();
+void tick_screen_page_submenu_luft();
+void create_screen_page_submenu_boden();
+void tick_screen_page_submenu_boden();
+void create_screen_page_submenu_co2();
+void tick_screen_page_submenu_co2();
+void create_screen_page_submenu_wlan();
+void tick_screen_page_submenu_wlan();
+void create_screen_page_einstellungen();
+void tick_screen_page_einstellungen();
+void create_screen_page_datum_einstellen();
+void tick_screen_page_datum_einstellen();
+void create_screen_page_uhrzeit_einstellen();
+void tick_screen_page_uhrzeit_einstellen();
+void create_screen_page_sd_karte_anzeigen();
+void tick_screen_page_sd_karte_anzeigen();
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+/* === END FILE: include\screens.h === */
+/* === BEGIN FILE: include\SD_Karten_Treiber.h === */
+
+#ifndef SD_KARTEN_TREIBER_H
+#define SD_KARTEN_TREIBER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <FS.h> 
+
+#define FS_REASON_SD_MOUNTED "sd_mounted"
+#define FS_REASON_SD_UNMOUNT "sd_unmount"
+#define FS_REASON_FS_ACTIVITY "fs_activity"
+
+
+#define CD_DEBOUNCE_MS 10
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+typedef enum {
+    SD_UPDATE_REASON_BOOT,
+    SD_UPDATE_REASON_MENU_TICK,
+    SD_UPDATE_REASON_MENU_EXIT,
+    SD_UPDATE_REASON_LOG_FLUSH,
+    SD_UPDATE_REASON_MANUAL,
+    SD_UPDATE_REASON_EXPORT_TXT_MANUAL, 
+    SD_UPDATE_REASON_FINALIZE_DAY       
+} sd_update_reason_t;
+
+
+
+typedef struct {
+    sd_update_reason_t reason;
+    char payload[96]; 
+} sd_job_t;
+
+
+typedef struct {
+    bool     mounted;
+    uint64_t free_bytes;
+    uint64_t total_bytes;
+    uint64_t last_successful_probe_ms;
+} sd_status_cache_t;
+
+
+typedef void (*fs_flush_hook_t)(const char* reason);
+void fs_flush_hook_register(fs_flush_hook_t fn);
+
+
+void sd_worker_init(void);
+
+
+
+
+typedef enum {
+    PHASE_MOUNT_BEGIN,
+    PHASE_MOUNT_END_SUCCESS,
+    PHASE_MOUNT_END_ERROR,
+    PHASE_PROBE_BEGIN,
+    PHASE_PROBE_END_SUCCESS,
+    PHASE_PROBE_END_ERROR,
+    PHASE_UNMOUNT_BEGIN,
+    PHASE_UNMOUNT_END_SUCCESS,
+} sd_observer_event_t;
+
+
+typedef void (*sd_observer_callback_t)(sd_observer_event_t event);
+typedef void (*sd_progress_callback_t)(uint32_t current_bytes, uint32_t total_bytes);
+
+
+void sd_register_observer(sd_observer_callback_t cb);
+void sd_register_progress_callback(sd_progress_callback_t cb);
+bool sd_is_idle(void);
+void sd_stats(uint32_t* retries, int32_t* last_err, uint32_t* last_change_ms);
+
+
+
+bool sd_try_get_status_cache(sd_status_cache_t* out_cache);
+bool sd_global_io_lock(uint32_t timeout_ms);
+void sd_global_io_unlock(void);
+void sd_telemetry_take_and_reset(uint32_t* out_ops, uint64_t* out_bytes);
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+
+void sd_request_job(const sd_job_t& job);
+
+
+static inline void sd_request_update(sd_update_reason_t reason){
+    sd_job_t j; 
+    j.reason = reason; 
+    j.payload[0] = '\0';
+    sd_request_job(j);
+}
+
+
+bool sd_preallocate_file(File& file, size_t size);
+#endif
+
+
+#endif
+
+/* === END FILE: include\SD_Karten_Treiber.h === */
+/* === BEGIN FILE: include\styles.h === */
+#pragma once
+#include <lvgl.h>
+
+namespace UI {
+  
+  extern const uint32_t COL_BG, COL_FG, COL_ACCENT;
+  extern const lv_font_t* FONT_SM; 
+  extern const lv_font_t* FONT_MD; 
+  extern const lv_font_t* FONT_LG; 
+
+  
+  void init_styles();
+
+  
+  void label_fg(lv_obj_t* o, const lv_font_t* f=nullptr);
+  void label_accent(lv_obj_t* o, const lv_font_t* f=nullptr);
+  void bar_accent(lv_obj_t* o);
+}
+/* === END FILE: include\styles.h === */
+/* === BEGIN FILE: include\Task_Ticker.h === */
+#ifndef TASK_TICKER_H
+#define TASK_TICKER_H
+
+#include <Arduino.h>
+
+using TaskCallback = void (*)();
+using TaskDropCallback = void (*)(const char* dropped_task_name);
+
+struct ScheduledTask {
+    unsigned long nextRun;   
+    unsigned long interval;  
+    TaskCallback  callback;  
+    bool          repeat;    
+    bool          active;    
+    bool          running;   
+    const char*   name;      
+    uint32_t      overrun_count; 
+};
+
+#ifndef MAX_TASKS
+#define MAX_TASKS 16
+#endif
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+void task_ticker_loop(); 
+
+
+#if __cplusplus >= 201402L
+[[deprecated("Bitte addTaskNamed verwenden. Anonyme Tasks sind nicht mehr vorgesehen.")]]
+#endif
+int  addTask(unsigned long delayMs, TaskCallback cb, bool repeat = false);
+
+#if __cplusplus >= 201402L
+[[deprecated("Bitte addTaskPhasedNamed verwenden. Anonyme Tasks sind nicht mehr vorgesehen.")]]
+#endif
+int  addTaskPhased(unsigned long initialDelayMs, unsigned long intervalMs, TaskCallback cb, bool repeat = false);
+
+#if __cplusplus >= 201402L
+[[deprecated("Bitte addTaskImmediateNamed verwenden. Anonyme Tasks sind nicht mehr vorgesehen.")]]
+#endif
+int  addTaskImmediate(unsigned long intervalMs, TaskCallback cb, bool repeat = false);
+
+
+
+int  addTaskNamed(const char* name, unsigned long delayMs, TaskCallback cb, bool repeat = false);
+int  addTaskPhasedNamed(const char* name, unsigned long initialDelayMs, unsigned long intervalMs, TaskCallback cb, bool repeat = false);
+int  addTaskImmediateNamed(const char* name, unsigned long intervalMs, TaskCallback cb, bool repeat = false);
+
+void removeTask(int taskId);
+void updateTaskInterval(int taskId, unsigned long newInterval);
+
+
+int  task_slots_free();   
+int  task_count_active(); 
+void dump_tasks();        
+
+void setTickBudgetMs(uint16_t ms);
+uint16_t getTickBudgetMs();
+unsigned long getTickerLoopLastUs();
+uint32_t getTickerOverrunsCount();
+long getTaskLastRuntimeUs(int taskId);
+uint32_t getTaskOverrunCount(int taskId);
+
+
+uint32_t getTaskDropsCount();
+void setTaskDropCallback(TaskDropCallback cb);
+
+#endif
+/* === END FILE: include\Task_Ticker.h === */

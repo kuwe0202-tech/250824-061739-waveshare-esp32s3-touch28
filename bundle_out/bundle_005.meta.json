@@ -1,0 +1,15 @@
+{
+    "bundle":  "bundle_005.txt",
+    "total_code_len":  12632,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\Konfiguration.cpp",
+                      "code_len":  11088
+                  },
+                  {
+                      "rel":  "src\\Log.cpp",
+                      "code_len":  1618
+                  }
+              ]
+}

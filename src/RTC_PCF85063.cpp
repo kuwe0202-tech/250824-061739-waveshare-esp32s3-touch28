@@ -1,0 +1,376 @@
+/* === BEGIN FILE: src\RTC_PCF85063.cpp === */
+
+#include "RTC_PCF85063.h"
+#include "PlatformConfig.h"
+#include "Konfiguration.h"
+#include "Log.h"
+#include "runtime_tasks.h"
+#include <cstring>
+#include <Wire.h>
+#include "ui.h"
+#include "screens.h"
+#include "boot_header.h"
+#include <time.h>
+
+datetime_t rtc_datetime = {0};
+
+static rtc_update_hook_t s_rtc_hook = nullptr;
+// --- NEU: Zustand für den "RTC valid" Callback ---
+static rtc_valid_callback_t s_rtc_valid_cb = nullptr;
+static bool s_valid_cb_fired = false;
+
+void rtc_set_update_hook(rtc_update_hook_t cb) { s_rtc_hook = cb; }
+
+static uint8_t decToBcd(int val) { return (uint8_t)((val / 10 * 16) + (val % 10)); }
+static int bcdToDec(uint8_t val) { return (int)((val / 16 * 10) + (val % 16)); }
+static inline int _bcd2(uint8_t b) { return (b & 0x0F) + 10 * ((b >> 4) & 0x0F); }
+static TwoWire& get_rtc_bus() { return (platform.i2c_port_rtc == 1) ? Wire1 : Wire; }
+
+static bool i2c_write_u8_(uint8_t reg, uint8_t val) {
+  TwoWire& bus = get_rtc_bus();
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(reg);
+  bus.write(val);
+  return (bus.endTransmission() == 0);
+}
+static bool i2c_read_u8_(uint8_t reg, uint8_t* out) {
+  TwoWire& bus = get_rtc_bus();
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(reg);
+  if (bus.endTransmission(false) != 0) return false;
+  if (bus.requestFrom(platform.i2c_addr_rtc, (uint8_t)1) != 1) return false;
+  *out = bus.read();
+  return true;
+}
+static bool read_seconds_raw_(uint8_t* sec_bcd) {
+  return i2c_read_u8_(RTC_SECOND_ADDR, sec_bcd);
+}
+
+static bool rtc_abs_from_bus_(TwoWire& bus, char* out, size_t n) {
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ADDR);
+  if (bus.endTransmission(false) != 0) return false;
+  if (bus.requestFrom(platform.i2c_addr_rtc, (uint8_t)7) != 7) return false;
+  uint8_t sec_b = bus.read(), min_b = bus.read(), hr_b = bus.read(), day_b = bus.read();
+  (void)bus.read();
+  uint8_t mon_b = bus.read(), yr_b = bus.read();
+  int S = _bcd2(sec_b & 0x7F), M = _bcd2(min_b & 0x7F), H = _bcd2(hr_b & 0x3F);
+  int d = _bcd2(day_b & 0x3F), m = _bcd2(mon_b & 0x1F), y = Config::RTC_YEAR_OFFSET + _bcd2(yr_b);
+  if (y < Config::RTC_MIN_YEAR || m < 1 || m > 12 || d < 1 || d > 31 || H > 23 || M > 59 || S > 59) return false;
+  return snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d", y, m, d, H, M, S) > 0;
+}
+
+static bool _rtc_iso8601(char* buf, size_t n) {
+  if (rtc_datetime.year >= 1970) {
+    snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d",
+             rtc_datetime.year, rtc_datetime.month, rtc_datetime.day,
+             rtc_datetime.hour, rtc_datetime.minute, rtc_datetime.second);
+    return true;
+  }
+  TwoWire& bus = get_rtc_bus();
+  return rtc_abs_from_bus_(bus, buf, n);
+}
+bool rtc_make_iso_timestamp(char* buf, size_t buflen) { return _rtc_iso8601(buf, buflen); }
+
+static bool rtc_start_oscillator_() {
+  uint8_t ctrl1 = 0;
+  if (!i2c_read_u8_(RTC_CTRL_1_ADDR, &ctrl1)) { LOGE("[RTC] read CTRL1 failed"); return false; }
+  uint8_t newc1 = (uint8_t)(ctrl1 & ~RTC_CTRL_1_STOP);
+  if (Config::RTC_USE_CAP_SEL) newc1 |= RTC_CTRL_1_CAP_SEL;
+  if (newc1 != ctrl1) {
+    if (!i2c_write_u8_(RTC_CTRL_1_ADDR, newc1)) { LOGE("[RTC] write CTRL1 failed"); return false; }
+  }
+  uint8_t rb = 0;
+  if (!i2c_read_u8_(RTC_CTRL_1_ADDR, &rb)) { LOGE("[RTC] readback CTRL1 failed"); return false; }
+  if (rb & RTC_CTRL_1_STOP) { LOGW("[RTC] STOP still set"); return false; }
+  return true;
+}
+
+static int64_t s_wall_boot_offset_us = 0;
+static bool    s_offset_valid        = false;
+
+uint64_t datetime_to_unix_us_(const datetime_t& dt){
+  struct tm t;
+  t.tm_year = dt.year - 1900;
+  t.tm_mon = dt.month - 1;
+  t.tm_mday = dt.day;
+  t.tm_hour = dt.hour;
+  t.tm_min = dt.minute;
+  t.tm_sec = dt.second;
+  time_t time_since_epoch = mktime(&t);
+  return (uint64_t)time_since_epoch * 1000000ULL;
+}
+
+void rtc_notify_time_set(uint64_t new_wallclock_us){
+  const uint64_t now_boot_us = ts_boot_us();
+  const int64_t  new_off     = (int64_t)new_wallclock_us - (int64_t)now_boot_us;
+
+  if (s_offset_valid) {
+    const int64_t delta = new_off - s_wall_boot_offset_us;
+    const int64_t thr_us = (int64_t)CFG_CLOCK_JUMP_THRESHOLD_S * 1000000LL;
+    if ((delta > thr_us) || (delta < -thr_us)) {
+      char detail[64];
+      snprintf(detail, sizeof(detail), "{delta_us=%lld}", (long long)delta);
+      telemetry_event("clock_jump", detail);
+      LOGW_T("RTC", "CLOCK_JUMP{delta_us=%lld}", (long long)delta);
+    }
+  }
+  s_wall_boot_offset_us = new_off;
+  s_offset_valid = true;
+}
+bool rtc_is_valid(void){ return rtc_has_valid_time(); }
+
+void rtc_pcf85063_init() {
+  LOG_INIT_BEGIN("RTC");
+  
+  log_set_rtc_provider(&rtc_make_iso_timestamp);
+  for (uint8_t retries = 0; retries < Config::RTC_MAX_RETRIES; ++retries) {
+    (void)rtc_start_oscillator_();
+    uint8_t s1_bcd = 0;
+    if (!read_seconds_raw_(&s1_bcd)) { watchdog_safe_delay(Config::RTC_RETRY_GAP_MS); continue; }
+    watchdog_safe_delay(Config::RTC_ADVANCE_WAIT_MS);
+    uint8_t s2_bcd = 0;
+    if (!read_seconds_raw_(&s2_bcd)) { watchdog_safe_delay(Config::RTC_RETRY_GAP_MS); continue; }
+    if (s1_bcd != s2_bcd) { LOG_INIT_READY("RTC"); tel_rtc_mark_synced(); return; }
+    LOGW("[RTC] Clock not running, trying kick...");
+    uint8_t c1 = 0;
+    i2c_read_u8_(RTC_CTRL_1_ADDR, &c1);
+    i2c_write_u8_(RTC_CTRL_1_ADDR, (uint8_t)(c1 | RTC_CTRL_1_STOP));
+    watchdog_safe_delay(Config::RTC_KICK_PAUSE_MS);
+    i2c_read_u8_(RTC_CTRL_1_ADDR, &c1);
+    i2c_write_u8_(RTC_CTRL_1_ADDR, (uint8_t)(c1 & ~RTC_CTRL_1_STOP));
+    watchdog_safe_delay(Config::RTC_RETRY_GAP_MS);
+  }
+  LOG_INIT_FAIL("RTC", "Clock did not start after %d retries", Config::RTC_MAX_RETRIES);
+}
+
+void rtc_sync_system_time_from_hw(void) {
+    if (rtc_is_valid()) {
+        uint64_t wall_us = datetime_to_unix_us_(rtc_datetime);
+        rtc_notify_time_set(wall_us);
+        LOGI_T("RTC", "Systemzeit wurde mit der Hardware-RTC synchronisiert.");
+    } else {
+        LOGW_T("RTC", "Überspringe Systemzeit-Synchronisation, da die RTC-Zeit ungültig ist.");
+    }
+}
+
+// --- NEU: Implementierung der neuen Funktionen ---
+uint64_t rtc_get_unix_us_now(void) {
+    if (rtc_is_valid()) {
+        return datetime_to_unix_us_(rtc_datetime);
+    }
+    return 0;
+}
+
+void rtc_set_valid_callback(rtc_valid_callback_t cb) {
+    s_rtc_valid_cb = cb;
+}
+// --- Ende der neuen Implementierungen ---
+
+void RTC_PCF85063_Loop() {
+  datetime_t old = rtc_datetime;
+  RTC_PCF85063_Read_Time(&rtc_datetime);
+
+  // --- NEU: Einmaligen Callback auslösen ---
+  if (s_rtc_valid_cb && !s_valid_cb_fired && rtc_is_valid()) {
+      s_valid_cb_fired = true;
+      s_rtc_valid_cb();
+  }
+  // --- Ende der neuen Logik ---
+
+  if (rtc_datetime.second != old.second) {
+    rtc_uhr_aktualisieren();
+    if (rtc_datetime.day != old.day || rtc_datetime.month != old.month || rtc_datetime.year != old.year) {
+      rtc_datum_aktualisieren();
+      rtc_wochentag_aktualisieren();
+    }
+    if (s_rtc_hook) s_rtc_hook(&rtc_datetime);
+  }
+}
+
+void RTC_PCF85063_Set_Time(const datetime_t &time) {
+  TwoWire& bus = get_rtc_bus();
+  uint8_t buf[3] = { decToBcd(time.second), decToBcd(time.minute), decToBcd(time.hour) };
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ADDR);
+  bus.write(buf, 3);
+  if (bus.endTransmission() == 0) {
+    tel_rtc_mark_synced();
+    RTC_PCF85063_Read_Time(&rtc_datetime);
+    rtc_uhr_aktualisieren();
+    if (s_rtc_hook) s_rtc_hook(&rtc_datetime);
+    if (rtc_has_valid_time()) {
+      rtc_notify_time_set(datetime_to_unix_us_(rtc_datetime));
+    }
+  } else { LOGE("[RTC] Set_Time failed"); }
+}
+
+void RTC_PCF85063_Set_Date(const datetime_t &date) {
+  TwoWire& bus = get_rtc_bus();
+  uint8_t buf[4] = { decToBcd(date.day), decToBcd(date.dotw), decToBcd(date.month), decToBcd(date.year - Config::RTC_YEAR_OFFSET) };
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_DAY_ADDR);
+  bus.write(buf, 4);
+  if (bus.endTransmission() == 0) {
+    tel_rtc_mark_synced();
+    RTC_PCF85063_Read_Time(&rtc_datetime);
+    rtc_datum_aktualisieren();
+    rtc_wochentag_aktualisieren();
+    if (s_rtc_hook) s_rtc_hook(&rtc_datetime);
+    if (rtc_has_valid_time()) {
+      rtc_notify_time_set(datetime_to_unix_us_(rtc_datetime));
+    }
+  } else { LOGE("[RTC] Set_Date failed"); }
+}
+
+void RTC_PCF85063_Set_All(const datetime_t &time) {
+  TwoWire& bus = get_rtc_bus();
+  uint8_t buf[7] = { decToBcd(time.second), decToBcd(time.minute), decToBcd(time.hour),
+                     decToBcd(time.day), decToBcd(time.dotw), decToBcd(time.month),
+                     decToBcd(time.year - Config::RTC_YEAR_OFFSET) };
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ADDR);
+  bus.write(buf, 7);
+  if (bus.endTransmission() == 0) {
+    tel_rtc_mark_synced();
+    RTC_PCF85063_Read_Time(&rtc_datetime);
+    rtc_uhr_aktualisieren();
+    rtc_datum_aktualisieren();
+    rtc_wochentag_aktualisieren();
+    if (s_rtc_hook) s_rtc_hook(&rtc_datetime);
+    if (rtc_has_valid_time()) {
+      rtc_notify_time_set(datetime_to_unix_us_(rtc_datetime));
+    }
+  } else { LOGE("[RTC] Set_All failed"); }
+}
+
+void RTC_PCF85063_Read_Time(datetime_t *time) {
+  TwoWire& bus = get_rtc_bus();
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ADDR);
+  bus.endTransmission(false);
+  bus.requestFrom(platform.i2c_addr_rtc, (uint8_t)7);
+  uint8_t buf[7] = {0};
+  for (uint8_t i = 0; i < 7 && bus.available(); i++) buf[i] = bus.read();
+  time->second = bcdToDec(buf[0] & 0x7F);
+  time->minute = bcdToDec(buf[1] & 0x7F);
+  time->hour   = bcdToDec(buf[2] & 0x3F);
+  time->day    = bcdToDec(buf[3] & 0x3F);
+  time->dotw   = bcdToDec(buf[4] & 0x07);
+  time->month  = bcdToDec(buf[5] & 0x1F);
+  time->year   = Config::RTC_YEAR_OFFSET + bcdToDec(buf[6]);
+}
+
+void RTC_PCF85063_Enable_Alarm() {
+  TwoWire& bus = get_rtc_bus();
+  uint8_t value = (RTC_CTRL_2_DEFAULT | RTC_CTRL_2_AIE) & ~RTC_CTRL_2_AF;
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_CTRL_2_ADDR);
+  bus.write(value);
+  if (bus.endTransmission() != 0) { LOGE("[RTC] Enable_Alarm failed"); }
+}
+
+uint8_t RTC_PCF85063_Get_Alarm_Flag() {
+  TwoWire& bus = get_rtc_bus();
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_CTRL_2_ADDR);
+  bus.endTransmission(false);
+  bus.requestFrom(platform.i2c_addr_rtc, (uint8_t)1);
+  uint8_t value = 0;
+  if (bus.available()) value = bus.read();
+  return value & (RTC_CTRL_2_AF | RTC_CTRL_2_AIE);
+}
+
+void RTC_PCF85063_Set_Alarm(const datetime_t &time) {
+  TwoWire& bus = get_rtc_bus();
+  uint8_t buf[5] = { (uint8_t)(decToBcd(time.second) & ~RTC_ALARM),
+                     (uint8_t)(decToBcd(time.minute) & ~RTC_ALARM),
+                     (uint8_t)(decToBcd(time.hour) & ~RTC_ALARM),
+                     RTC_ALARM, RTC_ALARM };
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ALARM);
+  bus.write(buf, 5);
+  if (bus.endTransmission() != 0) { LOGE("[RTC] Set_Alarm failed"); }
+}
+
+void RTC_PCF85063_Read_Alarm(datetime_t *time) {
+  TwoWire& bus = get_rtc_bus();
+  bus.beginTransmission(platform.i2c_addr_rtc);
+  bus.write(RTC_SECOND_ALARM);
+  bus.endTransmission(false);
+  bus.requestFrom(platform.i2c_addr_rtc, (uint8_t)5);
+  uint8_t buf[5] = {0};
+  for (uint8_t i = 0; i < 5 && bus.available(); i++) buf[i] = bus.read();
+  time->second = bcdToDec(buf[0] & 0x7F);
+  time->minute = bcdToDec(buf[1] & 0x7F);
+  time->hour   = bcdToDec(buf[2] & 0x3F);
+  time->day    = bcdToDec(buf[3] & 0x3F);
+  time->dotw   = bcdToDec(buf[4] & 0x07);
+}
+
+static lv_obj_t *rtc_uhr_label = nullptr;
+static lv_obj_t *rtc_datum_label = nullptr;
+static lv_obj_t *rtc_wochentag_label = nullptr;
+
+void rtc_uhr_label_setzen(lv_obj_t *label) { rtc_uhr_label = label; }
+void rtc_datum_label_setzen(lv_obj_t *label) { rtc_datum_label = label; }
+void rtc_wochentag_label_setzen(lv_obj_t *label) { rtc_wochentag_label = label; }
+
+void RTC_PCF85063_SetupUhr(lv_obj_t *uhr_label) { rtc_uhr_label_setzen(uhr_label); }
+void RTC_PCF85063_SetupDatum(lv_obj_t *datum_label) { rtc_datum_label_setzen(datum_label); }
+void RTC_PCF85063_SetupWochentag(lv_obj_t *wochentag_label) { rtc_wochentag_label_setzen(wochentag_label); }
+
+void rtc_uhr_aktualisieren() {
+  if (!rtc_uhr_label) return;
+  char uhr_text[12];
+  snprintf(uhr_text, sizeof(uhr_text), "%02d:%02d:%02d", rtc_datetime.hour, rtc_datetime.minute, rtc_datetime.second);
+  lv_label_set_text(rtc_uhr_label, uhr_text);
+}
+
+void rtc_datum_aktualisieren() {
+  if (!rtc_datum_label) return;
+  char datum_text[20];
+  snprintf(datum_text, sizeof(datum_text), "%02d.%02d.%04d", rtc_datetime.day, rtc_datetime.month, rtc_datetime.year);
+  lv_label_set_text(rtc_datum_label, datum_text);
+}
+
+static const char *wochentag_abk[] = {"So","Mo","Di","Mi","Do","Fr","Sa"};
+
+void rtc_wochentag_aktualisieren() {
+  if (!rtc_wochentag_label) return;
+  char tag_text[4] = "--";
+  uint8_t tag = rtc_datetime.dotw;
+  if (tag < 7) { strncpy(tag_text, wochentag_abk[tag], 3); tag_text[3] = '\0'; }
+  lv_label_set_text(rtc_wochentag_label, tag_text);
+}
+
+uint8_t berechne_wochentag(uint16_t jahr, uint8_t monat, uint8_t tag) {
+  if (monat < 3) { monat += 12; jahr--; }
+  uint8_t zeller = (tag + 2*monat + 3*(monat+1)/5 + jahr + jahr/4 - jahr/100 + jahr/400) % 7;
+  return (zeller + 1) % 7;
+}
+
+void rtc_apply_from_ui_rollers() {
+  uint16_t stunde = lv_roller_get_selected(objects.roller_einstellungen_stunden);
+  uint16_t minute = lv_roller_get_selected(objects.roller_einstellungen_minuten);
+  uint16_t tag    = lv_roller_get_selected(objects.roller_einstellungen_tag) + 1;
+  uint16_t monat  = lv_roller_get_selected(objects.roller_einstellungen_monat) + 1;
+  uint16_t jahr_index = lv_roller_get_selected(objects.roller_einstellungen_jahr);
+  uint16_t jahr   = Config::RTC_UI_MIN_YEAR + jahr_index;
+  if (stunde > 23 || minute > 59 || tag < 1 || tag > 31 || monat < 1 || monat > 12 ||
+      jahr < Config::RTC_UI_MIN_YEAR || jahr > Config::RTC_UI_MAX_YEAR) return;
+  uint8_t dotw = berechne_wochentag(jahr, monat, tag);
+  datetime_t neu = { jahr, (uint8_t)monat, (uint8_t)tag, dotw, (uint8_t)stunde, (uint8_t)minute, 0 };
+  RTC_PCF85063_Set_All(neu);
+  pm_mark_user_activity();
+}
+
+
+bool rtc_get_wall_boot_offset_us(int64_t* offset) {
+    if (offset) {
+        *offset = s_wall_boot_offset_us;
+    }
+    return s_offset_valid;
+}
+
+/* === END FILE: src\RTC_PCF85063.cpp === */

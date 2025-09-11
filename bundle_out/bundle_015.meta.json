@@ -1,0 +1,11 @@
+{
+    "bundle":  "bundle_015.txt",
+    "total_code_len":  12636,
+    "canon_version":  "2025-09-11.2211",
+    "files":  [
+                  {
+                      "rel":  "src\\Task_Ticker.cpp",
+                      "code_len":  12636
+                  }
+              ]
+}

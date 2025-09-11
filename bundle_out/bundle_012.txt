@@ -1,0 +1,659 @@
+﻿KANON: Projekt-Hinweise klimakontroller
+Version: 2025-09-11.2211
+Gueltig ab: 2025-09-11
+Status: Diese Version ist allein gueltig. Fruehere Versionen sind ungueltig.
+Scope: Alle Projekt-Chats "klimakontroller".
+
+Abschnitt A - Erinnerung 1: Arbeitsregeln (extrem wichtig, strikt einzuhalten)
+[Erinnere dich an die erinnerung "Arbeitsregeln"]
+Abschnitt B - Erinnerung 2: Projektziel und Funktionsumfang
+[Erinnere dich an die erinnerung "Ziele klimakontroller"]
+Abschnitt C - Erinnerung 3: Rahmenbedinungen
+[Erinnere dich an die erinnerung "Rahmenbedingungen"]
+
+
+
+/* === BEGIN FILE: src\runtime_tasks.cpp === */
+
+#include "runtime_tasks.h"
+#include "Task_Ticker.h"
+#include "Log.h"
+#include "PlatformConfig.h"
+#include "lvgl.h"
+#include "screens.h"
+#include "RTC_PCF85063.h"
+#include "Touch_CST328.h"
+#include "Konfiguration.h"
+#include "SD_Karten_Treiber.h" 
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#if __has_include(<esp_heap_caps.h>)
+  #include <esp_heap_caps.h>
+#endif
+#if __has_include(<WiFi.h>)
+  #include <WiFi.h>
+#endif
+
+#include "boot_header.h"
+#include <inttypes.h>
+
+
+
+#if CFG_BOOT_FSM
+
+static bool g_fsm_gate_flags[FSM_GATE_SELFTEST + 1] = {false};
+static bool g_fsm_uart_only_mode = false;
+static char g_fsm_uart_only_reason[64] = {0};
+
+void fsm_init_gates() {
+    for (size_t i = 0; i < sizeof(g_fsm_gate_flags) / sizeof(g_fsm_gate_flags[0]); ++i) {
+        g_fsm_gate_flags[i] = false;
+    }
+    g_fsm_uart_only_mode = false;
+    g_fsm_uart_only_reason[0] = '\0';
+}
+
+void fsm_set_gate_flag(fsm_gate_t gate, bool value) {
+    if (gate <= FSM_GATE_SELFTEST) {
+        g_fsm_gate_flags[gate] = value;
+    }
+}
+
+bool fsm_get_gate_flag(fsm_gate_t gate) {
+    if (gate <= FSM_GATE_SELFTEST) {
+        return g_fsm_gate_flags[gate];
+    }
+    return false;
+}
+
+bool fsm_all_gates_ok() {
+    for (size_t i = 0; i < sizeof(g_fsm_gate_flags) / sizeof(g_fsm_gate_flags[0]); ++i) {
+        if (!g_fsm_gate_flags[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void fsm_set_uart_only_mode(const char* reason) {
+    g_fsm_uart_only_mode = true;
+    if (reason) {
+        strncpy(g_fsm_uart_only_reason, reason, sizeof(g_fsm_uart_only_reason) - 1);
+        g_fsm_uart_only_reason[sizeof(g_fsm_uart_only_reason) - 1] = '\0';
+        telemetry_event("uart_only_enabled", reason);
+    } else {
+        g_fsm_uart_only_reason[0] = '\0';
+        telemetry_event("uart_only_enabled", "unknown");
+    }
+}
+
+bool fsm_is_uart_only_mode() {
+    return g_fsm_uart_only_mode;
+}
+
+#endif
+
+
+volatile unsigned long touch_block_until    = 0;
+volatile unsigned long touch_deadzone_until = 0;
+
+extern void display_sleep();
+extern void display_wake();
+extern void set_backlight_percent(uint8_t pct);
+
+static int g_taskIdSYS   = -1;
+static int g_taskIdPM    = -1;
+static int g_taskIdWDT   = -1;
+static int g_taskIdBOOT  = -1;
+static int g_taskIdTOUCH = -1;  
+
+
+
+static bool     g_displaySleeping     = false;
+static uint32_t g_lastUserActivityMs  = 0;
+static uint8_t  g_backlight_pct       = 100;
+
+static volatile uint32_t g_sysTicks = 0;
+static volatile uint32_t g_pmTicks  = 0;
+
+static RuntimeTasksStatus g_rt{};
+
+static inline uint32_t now_ms() { return (uint32_t)millis(); }
+
+#define PM_IDLE_SLEEP_MS  (30*1000UL)
+
+static struct {
+  uint64_t ms_sum{0};
+  uint32_t ms_max{0};
+  uint64_t px_sum{0};
+  uint32_t cnt{0};
+  uint32_t full_cnt{0};
+} g_render;
+
+static const uint32_t g_px_full = (uint32_t)DISPLAY_WIDTH * (uint32_t)DISPLAY_HEIGHT;
+
+static uint32_t g_touch_err_cnt       = 0;
+static uint32_t g_i2c_retry_cnt       = 0;
+static uint32_t g_touch_last_valid_ms = 0;
+
+static bool     g_rtc_synced_once     = false;
+static uint32_t g_rtc_last_sync_ms    = 0;
+
+static uint32_t g_wdt_timeout_cfg_ms  = 0;   
+static volatile unsigned long last_alive = 0;
+static TaskHandle_t g_wdtHandle = nullptr;
+
+static uint32_t g_sys_min_free_k = 0xFFFFFFFF;
+
+static void pm_wake_if_needed() {
+  if (g_displaySleeping) {
+    g_displaySleeping = false;
+    display_wake();
+    set_backlight_percent(100);
+    g_backlight_pct = 100;
+  }
+}
+
+static void pm_sleep_if_idle() {
+  if (g_displaySleeping) return;
+  uint32_t idle = now_ms() - g_lastUserActivityMs;
+  if (idle >= PM_IDLE_SLEEP_MS) {
+    g_displaySleeping = true;
+    set_backlight_percent(0);
+    g_backlight_pct = 0;
+    display_sleep();
+  }
+}
+
+static void task_system_status() {
+  g_sysTicks++;
+  RTC_PCF85063_Loop();
+}
+
+static void task_power_manager() {
+  g_pmTicks++;
+  pm_sleep_if_idle();
+}
+
+static void task_touch_poll() {
+  updateMultiTouch();
+}
+
+static constexpr uint32_t BOOT_GUARD_TICK_MS = 50;
+
+static void task_boot_budget_guard() {
+  const bool touch_ok = touchInitialized;
+  const bool rtc_ok   = (rtc_datetime.year >= 2020);
+
+  if (touch_ok && rtc_ok) {
+    setTickBudgetMs(2);
+    if (g_taskIdBOOT != -1) {
+      removeTask(g_taskIdBOOT);
+      g_taskIdBOOT = -1;
+    }
+  }
+}
+
+static void task_telemetry_housekeeping() {
+    sd_request_update(SD_UPDATE_REASON_MANUAL);
+}
+
+void start_system_status_task(uint32_t period_ms) {
+  if (g_taskIdSYS != -1) removeTask(g_taskIdSYS);
+  g_taskIdSYS = addTaskNamed("sys.status", period_ms, task_system_status, true);
+}
+
+void stop_system_status_task() {
+  if (g_taskIdSYS != -1) { removeTask(g_taskIdSYS); g_taskIdSYS = -1; }
+}
+
+void start_power_manager_task(uint32_t period_ms) {
+  if (g_taskIdPM != -1) removeTask(g_taskIdPM);
+  g_taskIdPM = addTaskNamed("power.manager", period_ms, task_power_manager, true);
+}
+
+void stop_power_manager_task() {
+  if (g_taskIdPM != -1) { removeTask(g_taskIdPM); g_taskIdPM = -1; }
+}
+
+void start_touch_poll_task(uint32_t period_ms) {
+  if (g_taskIdTOUCH != -1) removeTask(g_taskIdTOUCH);
+  g_taskIdTOUCH = addTaskNamed("touch.poll", period_ms, task_touch_poll, true);
+}
+
+void stop_touch_poll_task() {
+  if (g_taskIdTOUCH != -1) { removeTask(g_taskIdTOUCH); g_taskIdTOUCH = -1; }
+}
+
+void pm_mark_user_activity() {
+  g_lastUserActivityMs = now_ms();
+  pm_wake_if_needed();
+}
+
+void runtime_tasks_init() {
+  LOG_INIT_BEGIN("Runtime-Tasks");
+
+  g_lastUserActivityMs = now_ms();
+  pm_wake_if_needed();
+
+  g_sysTicks = 0;
+  g_pmTicks  = 0;
+
+  setTickBudgetMs(5);
+
+  if (g_taskIdBOOT != -1) { removeTask(g_taskIdBOOT); g_taskIdBOOT = -1; }
+  g_taskIdBOOT = addTaskImmediateNamed("boot.guard", BOOT_GUARD_TICK_MS, task_boot_budget_guard, true);
+
+  start_system_status_task(1000);
+  start_power_manager_task(200);
+  start_touch_poll_task(Config::TOUCH_POLL_MS);
+
+  addTaskPhasedNamed("tel.housekeeping", 2000, TELEMETRY_SD_STALE_MS / 2, task_telemetry_housekeeping, true);
+
+  g_rt.sys_scheduled = (g_taskIdSYS >= 0);
+  g_rt.pm_scheduled  = (g_taskIdPM  >= 0);
+  g_rt.sys_ticks     = 0;
+  g_rt.pm_ticks      = 0;
+  g_rt.started_ms    = now_ms();
+
+  if (g_rt.sys_scheduled && g_rt.pm_scheduled) {
+    LOG_INIT_READY("Runtime-Tasks");
+  } else {
+    LOG_INIT_FAIL("Runtime-Tasks", "schedule sys=%d pm=%d", g_rt.sys_scheduled, g_rt.pm_scheduled);
+  }
+}
+
+RuntimeTasksStatus runtime_tasks_status() {
+  g_rt.sys_ticks = g_sysTicks;
+  g_rt.pm_ticks  = g_pmTicks;
+  return g_rt;
+}
+
+static constexpr unsigned long WDT_INTERVAL_MS = 2000;
+
+void watchdog_feed(void) { last_alive = millis(); }
+
+void watchdog_safe_delay(uint32_t ms) {
+    uint32_t start = millis();
+    while (millis() - start < ms) {
+        watchdog_feed();
+        delay(1);
+        yield();
+    }
+}
+
+static void safe_shutdown_once() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  set_backlight_percent(0);
+  display_sleep();
+}
+
+static void watchdogTask(void*) {
+  for (;;) {
+    unsigned long now  = millis();
+    unsigned long last = last_alive;
+    const unsigned long timeout_ms = platform.wdt_ui_ms;
+    if (now - last > timeout_ms) {
+      log_flush("wdt_timeout");
+      LOGE("Watchdog: timeout now=%lu last=%lu limit=%lu -> restart", now, last, timeout_ms);
+      safe_shutdown_once();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      esp_restart();
+    }
+    vTaskDelay(pdMS_TO_TICKS(WDT_INTERVAL_MS));
+  }
+}
+
+static void _wdt_selftest_tick() {
+  eTaskState st = eTaskGetState(g_wdtHandle);
+  if (st == eRunning || st == eReady || st == eBlocked) {
+    LOG_INIT_READY("Watchdog");
+  } else {
+    LOG_INIT_FAIL("Watchdog", "selftest state=%d", (int)st);
+  }
+}
+
+void watchdog_init() {
+  LOG_INIT_BEGIN("Watchdog");
+  if (g_wdtHandle) {
+    LOGW("Watchdog: bereits gestartet");
+    return;
+  }
+  last_alive = millis();
+  BaseType_t rc = xTaskCreatePinnedToCore(watchdogTask, "wdt", 2048, nullptr, 1, &g_wdtHandle, 0);
+  if (rc != pdPASS || g_wdtHandle == nullptr) {
+    LOG_INIT_FAIL("Watchdog", "task create rc=%ld", (long)rc);
+    return;
+  }
+  (void)addTaskPhasedNamed("wdt.selftest", 50, 0, _wdt_selftest_tick, false);
+}
+
+
+void tel_render_on_flush(uint32_t ms, uint32_t px, bool full_flush) {
+  g_render.ms_sum += ms;
+  if (ms > g_render.ms_max) g_render.ms_max = ms;
+  g_render.px_sum += px;
+  g_render.cnt++;
+  const bool eff_full = full_flush || (g_px_full && px >= g_px_full);
+  if (eff_full) g_render.full_cnt++;
+}
+
+void tel_touch_on_error()        { g_touch_err_cnt++; }
+void tel_i2c_on_retry()          { g_i2c_retry_cnt++; }
+void tel_touch_on_valid_sample() { g_touch_last_valid_ms = now_ms(); }
+void tel_rtc_mark_synced() {
+  g_rtc_synced_once  = true;
+  g_rtc_last_sync_ms = now_ms();
+}
+void tel_watchdog_set_timeout_ms(uint32_t timeout_ms) { g_wdt_timeout_cfg_ms = timeout_ms; }
+void tel_watchdog_mark_alive()                        { last_alive = millis(); }
+
+void telemetry_get_render(uint32_t* ms_avg, uint32_t* ms_max, uint32_t* px_avg, uint8_t*  fill_pct, uint32_t* full_flush_cnt) {
+  const uint32_t cnt = g_render.cnt ? g_render.cnt : 1;
+  if (ms_avg)  *ms_avg  = (uint32_t)(g_render.ms_sum / cnt);
+  if (ms_max)  *ms_max  = g_render.ms_max;
+  if (px_avg)  *px_avg  = (uint32_t)(g_render.px_sum / cnt);
+  if (fill_pct) {
+    uint32_t avg_px = (uint32_t)(g_render.px_sum / cnt);
+    uint32_t pct = (g_px_full ? (avg_px * 100u) / g_px_full : 0u);
+    if (pct > 100u) pct = 100u;
+    *fill_pct = (uint8_t)pct;
+  }
+  if (full_flush_cnt) *full_flush_cnt = g_render.full_cnt;
+}
+void telemetry_get_lvgl_heap(uint32_t* lv_used_k, uint8_t* lv_frag_pct) {
+#if LV_USE_MEM_MONITOR || 1
+  lv_mem_monitor_t mon{};
+  lv_mem_monitor(&mon);
+  uint32_t used = (mon.total_size > mon.free_size) ? (mon.total_size - mon.free_size) : 0;
+  if (lv_used_k)    *lv_used_k    = (used / 1024u);
+  if (lv_frag_pct)  *lv_frag_pct  = (uint8_t)mon.frag_pct;
+#else
+  if (lv_used_k)   *lv_used_k = 0;
+  if (lv_frag_pct) *lv_frag_pct = 0;
+#endif
+}
+void telemetry_get_sys_heap(uint32_t* free_k, uint32_t* min_free_k, uint32_t* largest_k) {
+#if __has_include(<esp_heap_caps.h>)
+  size_t free8   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t freeps  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t larg8   = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t largps  = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  uint32_t free_now_k = (uint32_t)((free8 + freeps)/1024u);
+  if (free_k) *free_k = free_now_k;
+  if (free_now_k < g_sys_min_free_k) g_sys_min_free_k = free_now_k;
+  if (min_free_k) *min_free_k = (g_sys_min_free_k==0xFFFFFFFF ? free_now_k : g_sys_min_free_k);
+  if (largest_k) *largest_k = (uint32_t)(( (larg8>largps?larg8:largps) )/1024u);
+#else
+  if (free_k)      *free_k = 0;
+  if (min_free_k)  *min_free_k = 0;
+  if (largest_k)   *largest_k = 0;
+#endif
+}
+void telemetry_get_scheduler(uint16_t* tick_budget_ms, uint16_t* loop_ms_last, uint32_t* overruns_cnt,
+                             uint32_t* active_tasks, uint32_t* free_slots, uint32_t* total_drops)
+{
+    if (tick_budget_ms) *tick_budget_ms = getTickBudgetMs();
+    if (loop_ms_last)   *loop_ms_last   = (uint16_t)(getTickerLoopLastUs() / 1000);
+    if (overruns_cnt)   *overruns_cnt   = getTickerOverrunsCount();
+    if (active_tasks)   *active_tasks   = task_count_active();
+    if (free_slots)     *free_slots     = task_slots_free();
+    if (total_drops)    *total_drops    = getTaskDropsCount();
+}
+void telemetry_get_touch_i2c(uint32_t* touch_err, uint32_t* i2c_retry, uint32_t* touch_stale_ms) {
+  if (touch_err)      *touch_err      = g_touch_err_cnt;
+  if (i2c_retry)      *i2c_retry      = g_i2c_retry_cnt;
+  if (touch_stale_ms) {
+    uint32_t lv = g_touch_last_valid_ms ? (now_ms() - g_touch_last_valid_ms) : 0xFFFFFFFFu;
+    *touch_stale_ms = lv;
+  }
+}
+void telemetry_get_rtc(bool* rtc_ok, uint32_t* rtc_age_s) {
+  if (rtc_ok) *rtc_ok = (rtc_datetime.year >= 2020);
+  if (rtc_age_s) {
+    if (g_rtc_last_sync_ms) *rtc_age_s = (now_ms() - g_rtc_last_sync_ms)/1000u;
+    else                    *rtc_age_s = 0xFFFFFFFFu;
+  }
+}
+
+bool telemetry_sd_is_stale() {
+    sd_status_cache_t cache;
+    if (!sd_try_get_status_cache(&cache) || cache.last_successful_probe_ms == 0) {
+        return true; 
+    }
+    return (now_ms() - cache.last_successful_probe_ms) > TELEMETRY_SD_STALE_MS;
+}
+
+bool telemetry_sd_ok() {
+  sd_status_cache_t cache;
+  if (!sd_try_get_status_cache(&cache)) {
+      return false; 
+  }
+  return cache.mounted && !telemetry_sd_is_stale();
+}
+
+uint32_t telemetry_fs_free_mb() {
+  sd_status_cache_t cache;
+  if (telemetry_sd_ok() && sd_try_get_status_cache(&cache)) {
+    return (uint32_t)(cache.free_bytes / (1024u * 1024u));
+  }
+  return 0; 
+}
+
+uint32_t telemetry_fs_total_mb() {
+  sd_status_cache_t cache;
+  if (telemetry_sd_ok() && sd_try_get_status_cache(&cache)) {
+    return (uint32_t)(cache.total_bytes / (1024u * 1024u));
+  }
+  return 0;
+}
+
+void telemetry_sd_io_stats_reset(uint32_t* out_ops, uint64_t* out_bytes) {
+    sd_telemetry_take_and_reset(out_ops, out_bytes);
+}
+
+int32_t telemetry_wdt_margin_ms() {
+  const uint32_t timeout_ms = g_wdt_timeout_cfg_ms ? g_wdt_timeout_cfg_ms : platform.wdt_ui_ms;
+  uint32_t now = now_ms();
+  uint32_t last = (uint32_t)last_alive;
+  uint32_t elapsed = now - last;
+  if (elapsed >= timeout_ms) return (int32_t)(timeout_ms) - (int32_t)elapsed; 
+  return (int32_t)(timeout_ms - elapsed);
+}
+uint8_t telemetry_backlight_pct() { return g_backlight_pct; }
+uint8_t telemetry_sleep_flag()    { return g_displaySleeping ? 1 : 0; }
+int16_t telemetry_rssi_dbm() {
+#if __has_include(<WiFi.h>)
+  if (WiFi.status() == WL_CONNECTED) return (int16_t)WiFi.RSSI();
+#endif
+  return 0;
+}
+bool telemetry_mqtt_ok() { return false; }
+uint16_t telemetry_ping_ms() { return 0; }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void telemetry_boot_fields(const struct boot_header_t* h) {
+    if (!h) return;
+    char uuid_str[37];
+    snprintf(uuid_str, sizeof(uuid_str), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        h->boot_uuid[0], h->boot_uuid[1], h->boot_uuid[2], h->boot_uuid[3],
+        h->boot_uuid[4], h->boot_uuid[5], h->boot_uuid[6], h->boot_uuid[7],
+        h->boot_uuid[8], h->boot_uuid[9], h->boot_uuid[10], h->boot_uuid[11],
+        h->boot_uuid[12], h->boot_uuid[13], h->boot_uuid[14], h->boot_uuid[15]);
+    LOGI_T("Telemetry", "Boot: Seq=%" PRIu64 ", Reason=%s, UUID=%s", h->boot_seq, h->reset_reason_txt, uuid_str);
+}
+
+void telemetry_event(const char* name, const char* detail) {
+    if (!name) return;
+    LOGI_T("Telemetry", "Event: '%s', Detail: '%s'", name, detail ? detail : "none");
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+/* === END FILE: src\runtime_tasks.cpp === */
+/* === BEGIN FILE: src\screens.cpp [part 1/3] === */
+
+#include <string.h>
+#include "screens.h"
+#include "fonts.h"
+#include "actions.h"
+#include "styles.h"
+#include "ui.h"
+#include "RTC_PCF85063.h"
+#include "ui_sd_manager.h" 
+#include "Konfiguration.h"
+
+objects_t objects;
+
+
+static lv_obj_t* ui_mk_label(lv_obj_t* parent, const char* text, const lv_font_t* font, bool is_accent) {
+    lv_obj_t* lbl = lv_label_create(parent);
+    if (text) {
+        lv_label_set_text(lbl, text);
+    }
+    if (is_accent) {
+        UI::label_accent(lbl, font);
+    } else {
+        UI::label_fg(lbl, font);
+    }
+    return lbl;
+}
+
+static lv_obj_t* ui_mk_btn_with_label(lv_obj_t* parent, const char* text, lv_coord_t w, lv_coord_t h, lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(UI::COL_BG), 0);
+    
+    lv_obj_t* lbl = ui_mk_label(btn, text, UI::FONT_MD, true);
+    lv_obj_center(lbl);
+    
+    return btn;
+}
+
+namespace UI {
+
+struct ClockTargets {
+  lv_obj_t* lbl_time{nullptr};
+  lv_obj_t* lbl_date{nullptr};
+  lv_obj_t* lbl_dotw{nullptr};
+};
+static ClockTargets  g_clk;
+static datetime_t    g_last{};
+static volatile bool g_dirty = false;
+static const char* dotw_name(uint8_t d) {
+  static const char* N[7] = {"So","Mo","Di","Mi","Do","Fr","Sa"};
+  return (d < 7) ? N[d] : "?";
+}
+static void clock_apply_() {
+  if (!g_dirty) return;
+  g_dirty = false;
+  const datetime_t now = g_last;
+  if (!rtc_has_valid_time()) {
+    if (g_clk.lbl_time)  lv_label_set_text_static(g_clk.lbl_time, "--:--:--");
+    if (g_clk.lbl_date)  lv_label_set_text_static(g_clk.lbl_date, "--.--.----");
+    if (g_clk.lbl_dotw)  lv_label_set_text_static(g_clk.lbl_dotw, "--");
+    return;
+  }
+  if (g_clk.lbl_time) lv_label_set_text_fmt(g_clk.lbl_time, "%02u:%02u:%02u", now.hour, now.minute, now.second);
+  if (g_clk.lbl_date) lv_label_set_text_fmt(g_clk.lbl_date, "%02u.%02u.%04u",  now.day,  now.month,  now.year);
+  if (g_clk.lbl_dotw) lv_label_set_text_static(g_clk.lbl_dotw, dotw_name(now.dotw));
+}
+static void clock_timer_cb(lv_timer_t*) { clock_apply_(); }
+static lv_timer_t* s_clock_tmr = nullptr;
+static void rtc_hook_(const datetime_t* now) {
+  g_last = *now;
+  g_dirty = true;
+}
+void clock_bind(const ClockTargets& t) {
+  g_clk = t;
+  rtc_set_update_hook(&rtc_hook_);
+  if (!s_clock_tmr) s_clock_tmr = lv_timer_create(clock_timer_cb, 100, nullptr);
+  g_dirty = true;
+  clock_apply_();
+}
+}
+
+
+#if CFG_BOOT_FSM
+
+static int s_last_boot_percent = -1;
+void ui_boot_screen_update_progress(int percent, const char* status_text) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    
+    if (percent > s_last_boot_percent) {
+        if (percent < s_last_boot_percent + CFG_BOOT_PROGRESS_SMOOTH_MIN_STEP_PCT) {
+            percent = s_last_boot_percent + CFG_BOOT_PROGRESS_SMOOTH_MIN_STEP_PCT;
+        }
+        if (percent > 100) percent = 100;
+    }
+    s_last_boot_percent = percent;
+
+    if (objects.boot_bar) {
+        lv_bar_set_value(objects.boot_bar, percent, LV_ANIM_ON);
+    }
+    if (objects.boot_label_percent) {
+        lv_label_set_text_fmt(objects.boot_label_percent, "%d%%", percent);
+    }
+    if (objects.boot_label_status) {
+        lv_label_set_text(objects.boot_label_status, status_text);
+    }
+}
+#endif
+
+
+static void event_handler_cb_page_startbildschirm_page_startbildschirm(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_SCREEN_LOADED) {
+        loadScreen(SCREEN_ID_PAGE_DESKTOP);
+    }
+}
+static void event_handler_cb_page_desktop_page_desktop(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_GESTURE) {
+        loadScreen(SCREEN_ID_PAGE_HAUPTMEN_);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_licht(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_CLICKED) {
+        loadScreen(SCREEN_ID_PAGE_SUBMENU_LICHT);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_luft(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_CLICKED) {
+        loadScreen(SCREEN_ID_PAGE_SUBMENU_LUFT);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_boden(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_CLICKED) {
+        loadScreen(SCREEN_ID_PAGE_SUBMENU_BODEN);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_wlan(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_CLICKED) {
+        loadScreen(SCREEN_ID_PAGE_SUBMENU_WLAN);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_einstellungen(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_CLICKED) {
+        loadScreen(SCREEN_ID_PAGE_EINSTELLUNGEN);
+    }
+}
+static void event_handler_cb_page_hauptmen__subbutton_zurueck_hauptmenu(lv_event_t *e) {
+
+/* === END FILE: src\screens.cpp [part 1/3] === */
